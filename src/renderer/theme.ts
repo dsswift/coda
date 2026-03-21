@@ -278,6 +278,8 @@ interface ThemeState {
   soundEnabled: boolean
   expandedUI: boolean
   defaultBaseDirectory: string
+  showDirLabel: boolean
+  preferredOpenWith: 'cli' | 'vscode'
   /** OS-reported dark mode — used when themeMode is 'system' */
   _systemIsDark: boolean
   setIsDark: (isDark: boolean) => void
@@ -285,6 +287,8 @@ interface ThemeState {
   setSoundEnabled: (enabled: boolean) => void
   setExpandedUI: (expanded: boolean) => void
   setDefaultBaseDirectory: (dir: string) => void
+  setShowDirLabel: (show: boolean) => void
+  setPreferredOpenWith: (app: 'cli' | 'vscode') => void
   /** Called by OS theme change listener — updates system value */
   setSystemTheme: (isDark: boolean) => void
 }
@@ -308,15 +312,15 @@ function applyTheme(isDark: boolean): void {
   syncTokensToCss(isDark ? darkColors : lightColors)
 }
 
-const SETTINGS_DEFAULTS = { themeMode: 'dark' as ThemeMode, soundEnabled: true, expandedUI: false, defaultBaseDirectory: '' }
+const SETTINGS_DEFAULTS = { themeMode: 'dark' as ThemeMode, soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', showDirLabel: false, preferredOpenWith: 'cli' as 'cli' | 'vscode' }
 
-function saveSettings(s: { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string }): void {
+function saveSettings(s: { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string; showDirLabel: boolean; preferredOpenWith: string }): void {
   window.clui?.saveSettings(s)
 }
 
-function getAllSettings(get: () => ThemeState): { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string } {
+function getAllSettings(get: () => ThemeState): { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string; showDirLabel: boolean; preferredOpenWith: string } {
   const s = get()
-  return { themeMode: s.themeMode, soundEnabled: s.soundEnabled, expandedUI: s.expandedUI, defaultBaseDirectory: s.defaultBaseDirectory }
+  return { themeMode: s.themeMode, soundEnabled: s.soundEnabled, expandedUI: s.expandedUI, defaultBaseDirectory: s.defaultBaseDirectory, showDirLabel: s.showDirLabel, preferredOpenWith: s.preferredOpenWith }
 }
 
 // Start with defaults; async load from disk will update immediately after mount.
@@ -328,6 +332,8 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   soundEnabled: saved.soundEnabled,
   expandedUI: saved.expandedUI,
   defaultBaseDirectory: saved.defaultBaseDirectory,
+  showDirLabel: saved.showDirLabel,
+  preferredOpenWith: saved.preferredOpenWith,
   _systemIsDark: true,
   setIsDark: (isDark) => {
     set({ isDark })
@@ -349,6 +355,14 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   },
   setDefaultBaseDirectory: (dir) => {
     set({ defaultBaseDirectory: dir })
+    saveSettings(getAllSettings(get))
+  },
+  setShowDirLabel: (show) => {
+    set({ showDirLabel: show })
+    saveSettings(getAllSettings(get))
+  },
+  setPreferredOpenWith: (app) => {
+    set({ preferredOpenWith: app })
     saveSettings(getAllSettings(get))
   },
   setSystemTheme: (isDark) => {
@@ -373,7 +387,9 @@ window.clui?.loadSettings().then((disk) => {
   const sound = typeof disk.soundEnabled === 'boolean' ? disk.soundEnabled : true
   const expanded = typeof disk.expandedUI === 'boolean' ? disk.expandedUI : false
   const baseDir = typeof disk.defaultBaseDirectory === 'string' ? disk.defaultBaseDirectory : ''
-  useThemeStore.setState({ themeMode: mode, isDark: resolved, soundEnabled: sound, expandedUI: expanded, defaultBaseDirectory: baseDir })
+  const dirLabel = typeof disk.showDirLabel === 'boolean' ? disk.showDirLabel : false
+  const openWith = (disk.preferredOpenWith === 'cli' || disk.preferredOpenWith === 'vscode') ? disk.preferredOpenWith : 'cli'
+  useThemeStore.setState({ themeMode: mode, isDark: resolved, soundEnabled: sound, expandedUI: expanded, defaultBaseDirectory: baseDir, showDirLabel: dirLabel, preferredOpenWith: openWith })
   applyTheme(resolved)
 })
 

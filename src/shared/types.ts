@@ -154,6 +154,8 @@ export interface TabState {
   attachments: Attachment[]
   messages: Message[]
   title: string
+  /** User-provided custom tab name (overrides auto-generated title when set) */
+  customTitle: string | null
   /** Last run's result data (cost, tokens, duration) */
   lastResult: RunResult | null
   /** Session metadata from init event */
@@ -315,6 +317,7 @@ export const IPC = {
   SELECT_DIRECTORY: 'clui:select-directory',
   OPEN_EXTERNAL: 'clui:open-external',
   OPEN_IN_TERMINAL: 'clui:open-in-terminal',
+  OPEN_IN_VSCODE: 'clui:open-in-vscode',
   ATTACH_FILES: 'clui:attach-files',
   TAKE_SCREENSHOT: 'clui:take-screenshot',
   TRANSCRIBE_AUDIO: 'clui:transcribe-audio',
@@ -401,6 +404,7 @@ export const IPC = {
 export interface PersistedTab {
   claudeSessionId: string
   title: string
+  customTitle: string | null
   workingDirectory: string
   hasChosenDirectory: boolean
   additionalDirs: string[]

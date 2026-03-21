@@ -50,6 +50,7 @@ interface State {
   createTab: () => Promise<string>
   selectTab: (tabId: string) => void
   closeTab: (tabId: string) => void
+  renameTab: (tabId: string, customTitle: string | null) => void
   clearTab: () => void
   toggleExpanded: () => void
   toggleMarketplace: () => void
@@ -108,6 +109,7 @@ function makeLocalTab(): TabState {
     attachments: [],
     messages: [],
     title: 'New Tab',
+    customTitle: null,
     lastResult: null,
     sessionModel: null,
     sessionTools: [],
@@ -348,7 +350,12 @@ export const useSessionStore = create<State>((set, get) => ({
 
     if (s.activeTabId === tabId) {
       if (remaining.length === 0) {
+        const homeDir = get().staticInfo?.homePath || '~'
+        const defaultBase = useThemeStore.getState().defaultBaseDirectory
+        const startDir = defaultBase || homeDir
         const newTab = makeLocalTab()
+        newTab.workingDirectory = startDir
+        newTab.hasChosenDirectory = !!defaultBase
         set({ tabs: [newTab], activeTabId: newTab.id })
         return
       }
@@ -358,6 +365,14 @@ export const useSessionStore = create<State>((set, get) => ({
     } else {
       set({ tabs: remaining })
     }
+  },
+
+  renameTab: (tabId, customTitle) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, customTitle } : t
+      ),
+    }))
   },
 
   clearTab: () => {
@@ -944,7 +959,8 @@ function persistTabs(): void {
     .filter((t) => t.claudeSessionId)
     .map((t) => ({
       claudeSessionId: t.claudeSessionId!,
-      title: t.title,
+      title: t.customTitle || t.title,
+      customTitle: t.customTitle,
       workingDirectory: t.workingDirectory,
       hasChosenDirectory: t.hasChosenDirectory,
       additionalDirs: t.additionalDirs,
