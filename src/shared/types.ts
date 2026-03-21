@@ -170,6 +170,8 @@ export interface TabState {
   hasChosenDirectory: boolean
   /** Extra directories accessible via --add-dir (session-preserving) */
   additionalDirs: string[]
+  /** Per-tab permission mode: 'ask' shows cards, 'auto' auto-approves, 'plan' uses CLI plan mode */
+  permissionMode: 'ask' | 'auto' | 'plan'
 }
 
 export interface Message {
@@ -274,6 +276,7 @@ export interface SessionLoadMessage {
   role: string
   content: string
   toolName?: string
+  toolInput?: string
   timestamp: number
 }
 
@@ -323,6 +326,7 @@ export const IPC = {
   ANIMATE_HEIGHT: 'clui:animate-height',
   LIST_SESSIONS: 'clui:list-sessions',
   LOAD_SESSION: 'clui:load-session',
+  READ_PLAN: 'clui:read-plan',
 
   // One-way events (main → renderer)
   TEXT_CHUNK: 'clui:text-chunk',
@@ -360,6 +364,14 @@ export const IPC = {
   // Permission mode
   SET_PERMISSION_MODE: 'clui:set-permission-mode',
 
+  // Settings persistence
+  LOAD_SETTINGS: 'clui:load-settings',
+  SAVE_SETTINGS: 'clui:save-settings',
+
+  // Tab persistence
+  LOAD_TABS: 'clui:load-tabs',
+  SAVE_TABS: 'clui:save-tabs',
+
   // Git operations
   GIT_GRAPH: 'clui:git-graph',
   GIT_CHANGES: 'clui:git-changes',
@@ -382,6 +394,22 @@ export const IPC = {
   RUN_COMPLETE: 'clui:run-complete',
   RUN_ERROR: 'clui:run-error',
 } as const
+
+// ─── Persisted Tab State ───
+
+export interface PersistedTab {
+  claudeSessionId: string
+  title: string
+  workingDirectory: string
+  hasChosenDirectory: boolean
+  additionalDirs: string[]
+  permissionMode: 'ask' | 'auto' | 'plan'
+}
+
+export interface PersistedTabState {
+  activeSessionId: string | null
+  tabs: PersistedTab[]
+}
 
 // ─── Git Types ───
 

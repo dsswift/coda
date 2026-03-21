@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, dialog, screen, globalShortcut, Tray, Menu, nativeImage, nativeTheme, shell, systemPreferences } from 'electron'
 import { join } from 'path'
-import { existsSync, readdirSync, statSync, createReadStream } from 'fs'
+import { existsSync, readdirSync, statSync, createReadStream, readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { unlink } from 'fs/promises'
 import { createInterface } from 'readline'
 import { homedir } from 'os'
@@ -33,11 +33,9 @@ const INTERACTIVE_PTY = process.env.CLUI_INTERACTIVE_PERMISSIONS_PTY === '1'
 
 const controlPlane = new ControlPlane(INTERACTIVE_PTY)
 
-// Keep native width fixed to avoid renderer animation vs setBounds race.
-// The UI itself still launches in compact mode; extra width is transparent/click-through.
-const BAR_WIDTH = 1040
-const PILL_HEIGHT = 720  // Fixed native window height — extra room for expanded UI + shadow buffers
-const PILL_BOTTOM_MARGIN = 24
+// The native window covers the full screen work area so that floating panels
+// (plan viewer, diff viewer, git panel) can be positioned anywhere without clipping.
+// The UI itself renders at the bottom center; all other regions are transparent/click-through.
 
 // ─── Broadcast to renderer ───
 
@@ -100,17 +98,13 @@ controlPlane.on('error', (tabId: string, error: EnrichedError) => {
 function createWindow(): void {
   const cursor = screen.getCursorScreenPoint()
   const display = screen.getDisplayNearestPoint(cursor)
-  const { width: screenWidth, height: screenHeight } = display.workAreaSize
-  const { x: dx, y: dy } = display.workArea
-
-  const x = dx + Math.round((screenWidth - BAR_WIDTH) / 2)
-  const y = dy + screenHeight - PILL_HEIGHT - PILL_BOTTOM_MARGIN
+  const { x: dx, y: dy, width: sw, height: sh } = display.workArea
 
   mainWindow = new BrowserWindow({
-    width: BAR_WIDTH,
-    height: PILL_HEIGHT,
-    x,
-    y,
+    width: sw,
+    height: sh,
+    x: dx,
+    y: dy,
     ...(process.platform === 'darwin' ? { type: 'panel' as const } : {}),  // NSPanel — non-activating, joins all spaces
     frame: false,
     transparent: true,
@@ -147,7 +141,25 @@ function createWindow(): void {
   })
 
   let forceQuit = false
-  app.on('before-quit', () => { forceQuit = true })
+  app.on('before-quit', (e) => {
+    if (forceQuit) return
+    e.preventDefault()
+    const hasRunning = controlPlane.hasRunningTabs()
+    const choice = dialog.showMessageBoxSync(mainWindow!, {
+      type: 'warning',
+      buttons: ['Quit', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      title: 'Quit Clui CC?',
+      message: hasRunning
+        ? 'Sessions are still running. Quitting will stop them.'
+        : 'Are you sure you want to quit?',
+    })
+    if (choice === 0) {
+      forceQuit = true
+      app.quit()
+    }
+  })
   mainWindow.on('close', (e) => {
     if (!forceQuit) {
       e.preventDefault()
@@ -169,13 +181,12 @@ function showWindow(source = 'unknown'): void {
   // Position on the display where the cursor currently is (not always primary)
   const cursor = screen.getCursorScreenPoint()
   const display = screen.getDisplayNearestPoint(cursor)
-  const { width: sw, height: sh } = display.workAreaSize
-  const { x: dx, y: dy } = display.workArea
+  const { x: dx, y: dy, width: sw, height: sh } = display.workArea
   mainWindow.setBounds({
-    x: dx + Math.round((sw - BAR_WIDTH) / 2),
-    y: dy + sh - PILL_HEIGHT - PILL_BOTTOM_MARGIN,
-    width: BAR_WIDTH,
-    height: PILL_HEIGHT,
+    x: dx,
+    y: dy,
+    width: sw,
+    height: sh,
   })
 
   // Always re-assert space membership — the flag can be lost after hide/show cycles
@@ -212,8 +223,7 @@ function toggleWindow(source = 'unknown'): void {
 }
 
 // ─── Resize ───
-// Fixed-height mode: ignore renderer resize events to prevent jank.
-// The native window stays at PILL_HEIGHT; all expand/collapse happens inside the renderer.
+// The native window covers the full work area; all expand/collapse happens inside the renderer.
 
 ipcMain.on(IPC.RESIZE_HEIGHT, () => {
   // No-op — fixed height window, no dynamic resize
@@ -337,13 +347,14 @@ ipcMain.handle(IPC.CLOSE_TAB, (_event, tabId: string) => {
   controlPlane.closeTab(tabId)
 })
 
-ipcMain.on(IPC.SET_PERMISSION_MODE, (_event, mode: string) => {
+ipcMain.on(IPC.SET_PERMISSION_MODE, (_event, payload: { tabId: string; mode: string }) => {
+  const { tabId, mode } = payload
   if (mode !== 'ask' && mode !== 'auto' && mode !== 'plan') {
     log(`IPC SET_PERMISSION_MODE: invalid mode "${mode}" — ignoring`)
     return
   }
-  log(`IPC SET_PERMISSION_MODE: ${mode}`)
-  controlPlane.setPermissionMode(mode)
+  log(`IPC SET_PERMISSION_MODE: tab=${tabId} mode=${mode}`)
+  controlPlane.setPermissionMode(tabId, mode)
 })
 
 ipcMain.handle(IPC.RESPOND_PERMISSION, (_event, { tabId, questionId, optionId }: { tabId: string; questionId: string; optionId: string }) => {
@@ -472,6 +483,7 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
                     role: 'tool',
                     content: '',
                     toolName: block.name,
+                    toolInput: block.input ? JSON.stringify(block.input) : undefined,
                     timestamp: new Date(obj.timestamp).getTime(),
                   })
                 }
@@ -486,6 +498,18 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
   } catch (err) {
     log(`LOAD_SESSION error: ${err}`)
     return []
+  }
+})
+
+ipcMain.handle(IPC.READ_PLAN, async (_e, filePath: string) => {
+  try {
+    if (!filePath || !existsSync(filePath)) return { content: null, fileName: null }
+    const content = readFileSync(filePath, 'utf-8')
+    const fileName = filePath.split('/').pop() || filePath
+    return { content, fileName }
+  } catch (err) {
+    log(`READ_PLAN error: ${err}`)
+    return { content: null, fileName: null }
   }
 })
 
@@ -893,6 +917,56 @@ ipcMain.handle(IPC.MARKETPLACE_INSTALL, async (_event, { repo, pluginName, marke
 ipcMain.handle(IPC.MARKETPLACE_UNINSTALL, async (_event, { pluginName }: { pluginName: string }) => {
   log(`IPC MARKETPLACE_UNINSTALL: ${pluginName}`)
   return uninstallPlugin(pluginName)
+})
+
+// ─── Settings Persistence ───
+
+const SETTINGS_DIR = join(homedir(), '.clui')
+const SETTINGS_FILE = join(SETTINGS_DIR, 'settings.json')
+const SETTINGS_DEFAULTS = { themeMode: 'dark', soundEnabled: true, expandedUI: false }
+
+ipcMain.handle(IPC.LOAD_SETTINGS, () => {
+  try {
+    if (existsSync(SETTINGS_FILE)) {
+      return { ...SETTINGS_DEFAULTS, ...JSON.parse(readFileSync(SETTINGS_FILE, 'utf-8')) }
+    }
+  } catch (err) {
+    log(`Failed to load settings: ${err}`)
+  }
+  return SETTINGS_DEFAULTS
+})
+
+ipcMain.handle(IPC.SAVE_SETTINGS, (_event, data: Record<string, unknown>) => {
+  try {
+    if (!existsSync(SETTINGS_DIR)) mkdirSync(SETTINGS_DIR, { recursive: true })
+    writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2))
+  } catch (err) {
+    log(`Failed to save settings: ${err}`)
+  }
+})
+
+// ─── Tab Persistence ───
+
+const TABS_FILE = join(SETTINGS_DIR, 'tabs.json')
+
+ipcMain.handle(IPC.LOAD_TABS, () => {
+  try {
+    if (existsSync(TABS_FILE)) {
+      return JSON.parse(readFileSync(TABS_FILE, 'utf-8'))
+    }
+  } catch (err) {
+    log(`Failed to load tabs: ${err}`)
+  }
+  return null
+})
+
+ipcMain.handle(IPC.SAVE_TABS, (_event, data: Record<string, unknown>) => {
+  try {
+    if (!existsSync(SETTINGS_DIR)) mkdirSync(SETTINGS_DIR, { recursive: true })
+    writeFileSync(TABS_FILE, JSON.stringify(data, null, 2))
+  } catch (err) {
+    log(`Failed to save tabs: ${err}`)
+  }
 })
 
 // ─── Git IPC Handlers ───

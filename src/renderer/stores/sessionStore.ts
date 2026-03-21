@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, CatalogPlugin, PluginStatus } from '../../shared/types'
+import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, CatalogPlugin, PluginStatus, PersistedTabState } from '../../shared/types'
 import { useThemeStore } from '../theme'
 import notificationSrc from '../../../resources/notification.mp3'
 
@@ -30,8 +30,6 @@ interface State {
   staticInfo: StaticInfo | null
   /** User's preferred model override (null = use default) */
   preferredModel: string | null
-  /** Global permission mode: 'ask' shows cards, 'auto' auto-approves, 'plan' uses CLI plan mode */
-  permissionMode: 'ask' | 'auto' | 'plan'
   /** Whether the git side panel is open */
   gitPanelOpen: boolean
 
@@ -120,6 +118,7 @@ function makeLocalTab(): TabState {
     workingDirectory: '~',
     hasChosenDirectory: false,
     additionalDirs: [],
+    permissionMode: 'plan',
   }
 }
 
@@ -131,7 +130,6 @@ export const useSessionStore = create<State>((set, get) => ({
   isExpanded: false,
   staticInfo: null,
   preferredModel: null,
-  permissionMode: 'ask',
   gitPanelOpen: false,
 
   // Marketplace
@@ -164,8 +162,13 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   setPermissionMode: (mode) => {
-    set({ permissionMode: mode })
-    window.clui.setPermissionMode(mode)
+    const { activeTabId } = get()
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === activeTabId ? { ...t, permissionMode: mode } : t
+      ),
+    }))
+    window.clui.setPermissionMode(activeTabId, mode)
   },
 
   createTab: async () => {
@@ -375,9 +378,16 @@ export const useSessionStore = create<State>((set, get) => ({
         role: m.role as Message['role'],
         content: m.content,
         toolName: m.toolName,
+        toolInput: m.toolInput,
         toolStatus: m.toolName ? 'completed' as const : undefined,
         timestamp: m.timestamp,
       }))
+
+      // Restore plan-ready state if last tool message was ExitPlanMode
+      const lastToolMsg = [...messages].reverse().find((m) => m.toolName)
+      const restoredDenied = lastToolMsg?.toolName === 'ExitPlanMode'
+        ? { tools: [{ toolName: 'ExitPlanMode', toolUseId: 'restored' }] }
+        : null
 
       const tab: TabState = {
         ...makeLocalTab(),
@@ -387,6 +397,7 @@ export const useSessionStore = create<State>((set, get) => ({
         workingDirectory: defaultDir,
         hasChosenDirectory: !!projectPath,
         messages,
+        permissionDenied: restoredDenied,
       }
       set((s) => ({
         tabs: [...s.tabs, tab],
@@ -917,3 +928,34 @@ export const useSessionStore = create<State>((set, get) => ({
     }))
   },
 }))
+
+// ─── Real-time tab persistence ───
+
+function persistTabs(): void {
+  const { tabs, activeTabId } = useSessionStore.getState()
+  const activeTab = tabs.find((t) => t.id === activeTabId)
+  const persistedTabs = tabs
+    .filter((t) => t.claudeSessionId)
+    .map((t) => ({
+      claudeSessionId: t.claudeSessionId!,
+      title: t.title,
+      workingDirectory: t.workingDirectory,
+      hasChosenDirectory: t.hasChosenDirectory,
+      additionalDirs: t.additionalDirs,
+      permissionMode: t.permissionMode,
+    }))
+
+  const data: PersistedTabState = {
+    activeSessionId: activeTab?.claudeSessionId || null,
+    tabs: persistedTabs,
+  }
+  window.clui.saveTabs(data)
+}
+
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+useSessionStore.subscribe((state, prev) => {
+  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId) {
+    if (saveTimer) clearTimeout(saveTimer)
+    saveTimer = setTimeout(persistTabs, 100)
+  }
+})
