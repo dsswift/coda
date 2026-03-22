@@ -176,6 +176,8 @@ export interface TabState {
   permissionMode: 'ask' | 'auto' | 'plan'
   /** Pending bash command results to send as context with next prompt */
   bashResults: Array<{ command: string; stdout: string; stderr: string }>
+  /** Custom pill outline color (null = use theme default) */
+  pillColor: string | null
 }
 
 export interface Message {
@@ -188,6 +190,8 @@ export interface Message {
   toolStatus?: 'running' | 'completed' | 'error'
   /** True for messages originating from user bash command entry (! prefix) */
   userExecuted?: boolean
+  /** True when the expand-tool-results setting auto-expanded this result */
+  autoExpandResult?: boolean
   timestamp: number
 }
 
@@ -422,6 +426,7 @@ export interface PersistedTab {
   additionalDirs: string[]
   permissionMode: 'ask' | 'auto' | 'plan'
   bashResults?: Array<{ command: string; stdout: string; stderr: string }>
+  pillColor?: string | null
 }
 
 export interface PersistedTabState {

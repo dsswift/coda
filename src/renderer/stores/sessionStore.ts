@@ -52,7 +52,9 @@ interface State {
   createTab: () => Promise<string>
   selectTab: (tabId: string) => void
   closeTab: (tabId: string) => void
+  reorderTabs: (reorderedTabs: TabState[]) => void
   renameTab: (tabId: string, customTitle: string | null) => void
+  setTabPillColor: (tabId: string, color: string | null) => void
   clearTab: () => void
   toggleExpanded: () => void
   toggleMarketplace: () => void
@@ -126,6 +128,7 @@ function makeLocalTab(): TabState {
     additionalDirs: [],
     permissionMode: useThemeStore.getState().defaultPermissionMode,
     bashResults: [],
+    pillColor: null,
   }
 }
 
@@ -375,10 +378,22 @@ export const useSessionStore = create<State>((set, get) => ({
     }
   },
 
+  reorderTabs: (reorderedTabs) => {
+    set({ tabs: reorderedTabs })
+  },
+
   renameTab: (tabId, customTitle) => {
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.id === tabId ? { ...t, customTitle } : t
+      ),
+    }))
+  },
+
+  setTabPillColor: (tabId, color) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, pillColor: color } : t
       ),
     }))
   },
@@ -804,8 +819,11 @@ export const useSessionStore = create<State>((set, get) => ({
             const targetTool = [...msgs3].reverse().find((m) => m.role === 'tool' && m.toolId === event.toolId)
             if (targetTool) {
               targetTool.content = event.content
-              if (event.isError) {
+              if (event.isError && targetTool.toolName !== 'ExitPlanMode' && targetTool.toolName !== 'AskUserQuestion') {
                 targetTool.toolStatus = 'error'
+              }
+              if (useThemeStore.getState().expandToolResults && ['Write', 'Edit', 'NotebookEdit'].includes(targetTool.toolName || '')) {
+                targetTool.autoExpandResult = true
               }
             }
             updated.messages = msgs3
@@ -861,6 +879,15 @@ export const useSessionStore = create<State>((set, get) => ({
                         timestamp: Date.now(),
                       },
                     ]
+                  } else if (block.input) {
+                    // Ensure toolInput has complete data from the assembled assistant message
+                    // (streaming tool_call_update events may have been incomplete)
+                    const completeInput = JSON.stringify(block.input, null, 2)
+                    if (exists.toolInput !== completeInput) {
+                      updated.messages = updated.messages.map((m) =>
+                        m === exists ? { ...m, toolInput: completeInput } : m
+                      )
+                    }
                   }
                 }
               }
@@ -1047,6 +1074,7 @@ function persistTabs(): void {
       additionalDirs: t.additionalDirs,
       permissionMode: t.permissionMode,
       ...(t.bashResults.length > 0 ? { bashResults: t.bashResults } : {}),
+      ...(t.pillColor ? { pillColor: t.pillColor } : {}),
     }))
 
   const data: PersistedTabState = {
