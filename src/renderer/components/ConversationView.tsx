@@ -204,12 +204,75 @@ export function ConversationView() {
               tools={tab.permissionDenied.tools}
               sessionId={tab.claudeSessionId}
               projectPath={staticInfo?.projectPath || process.cwd()}
+              messages={tab.messages}
               onDismiss={() => {
                 useSessionStore.setState((s) => ({
                   tabs: s.tabs.map((t) =>
                     t.id === tab.id ? { ...t, permissionDenied: null } : t
                   ),
                 }))
+              }}
+              onAnswer={(answer) => {
+                // Dismiss the card
+                useSessionStore.setState((s) => ({
+                  tabs: s.tabs.map((t) =>
+                    t.id === tab.id ? { ...t, permissionDenied: null } : t
+                  ),
+                }))
+                // Resume session with the answer (no mode change, no context clear)
+                sendMessage(answer)
+              }}
+              onImplement={async (mode, clearContext) => {
+                // Dismiss the card
+                useSessionStore.setState((s) => ({
+                  tabs: s.tabs.map((t) =>
+                    t.id === tab.id ? { ...t, permissionDenied: null } : t
+                  ),
+                }))
+                // Switch permission mode
+                useSessionStore.getState().setPermissionMode(mode)
+
+                let implementPrompt = 'Implement the plan'
+
+                if (clearContext) {
+                  // Snapshot messages BEFORE any async work or state clearing
+                  const messages = [...tab.messages]
+
+                  // Extract plan file path from messages
+                  const exitMsg = messages.reverse().find(
+                    (m) => m.toolName === 'ExitPlanMode' && m.toolInput
+                  )
+                  let planContent: string | null = null
+                  if (exitMsg?.toolInput) {
+                    try {
+                      const input = JSON.parse(exitMsg.toolInput)
+                      const planFilePath = input.planFilePath as string
+                      if (planFilePath) {
+                        const result = await window.clui.readPlan(planFilePath)
+                        planContent = result.content
+                      }
+                    } catch (err) {
+                      console.warn('Failed to read plan file:', err)
+                    }
+                  }
+
+                  // Reset session (fresh Claude context) and clear messages
+                  window.clui.resetTabSession(tab.id)
+                  useSessionStore.setState((s) => ({
+                    tabs: s.tabs.map((t) =>
+                      t.id === tab.id
+                        ? { ...t, messages: [], claudeSessionId: null, lastResult: null, currentActivity: '', permissionQueue: [], permissionDenied: null, queuedPrompts: [] }
+                        : t
+                    ),
+                  }))
+
+                  // Include plan content in the prompt
+                  if (planContent) {
+                    implementPrompt = `Implement the following plan:\n\n${planContent}`
+                  }
+                }
+
+                sendMessage(implementPrompt)
               }}
             />
           )}
@@ -390,14 +453,16 @@ function InterruptButton({ tabId }: { tabId: string }) {
 
 function UserMessage({ message, skipMotion }: { message: Message; skipMotion?: boolean }) {
   const colors = useColors()
+  const isBashCmd = !!message.userExecuted
   const content = (
     <div
       className="text-[13px] leading-[1.5] px-3 py-1.5 max-w-[85%]"
       style={{
         background: colors.userBubble,
         color: colors.userBubbleText,
-        border: `1px solid ${colors.userBubbleBorder}`,
+        border: isBashCmd ? '2px solid rgba(244, 114, 182, 0.5)' : `1px solid ${colors.userBubbleBorder}`,
         borderRadius: '14px 14px 4px 14px',
+        whiteSpace: 'pre-wrap',
       }}
     >
       {message.content}
@@ -658,10 +723,67 @@ function getToolDescription(name: string, input?: string): string {
   }
 }
 
+function ToolResultBadge({ tool, colors }: { tool: Message; colors: ReturnType<typeof useColors> }) {
+  const [showResult, setShowResult] = useState(!!tool.userExecuted || !!tool.autoExpandResult)
+  const isError = tool.toolStatus === 'error'
+  const hasContent = !!tool.content
+  const lineCount = hasContent ? tool.content.split('\n').length : 0
+
+  return (
+    <>
+      <span className="inline-flex items-center gap-1 mt-0.5">
+        <span
+          className="inline-block text-[10px] px-1.5 py-[1px] rounded"
+          style={{
+            background: isError ? colors.statusErrorBg : colors.statusCompleteBg,
+            color: isError ? colors.statusError : colors.statusComplete,
+          }}
+        >
+          {isError ? 'Error' : 'Success'}
+        </span>
+        {hasContent && (
+          <span
+            className="text-[10px] cursor-pointer select-none"
+            style={{ color: colors.textMuted }}
+            onClick={() => setShowResult(!showResult)}
+          >
+            +{lineCount} line{lineCount !== 1 ? 's' : ''}
+          </span>
+        )}
+      </span>
+      {showResult && tool.content && (
+        <pre
+          className="text-[11px] leading-[1.4] p-2 rounded overflow-auto whitespace-pre-wrap break-words"
+          style={{
+            margin: '4px 0 0 0',
+            background: colors.surfaceHover,
+            color: colors.textSecondary,
+            maxHeight: tool.autoExpandResult ? undefined : 200,
+            border: `1px solid ${colors.toolBorder}`,
+          }}
+        >
+          {tool.content}
+        </pre>
+      )}
+    </>
+  )
+}
+
 function ToolGroup({ tools, skipMotion }: { tools: Message[]; skipMotion?: boolean }) {
   const hasRunning = tools.some((t) => t.toolStatus === 'running')
-  const [expanded, setExpanded] = useState(false)
+  const hasUserExecuted = tools.some((t) => t.userExecuted)
+  const expandToolResults = useThemeStore((s) => s.expandToolResults)
+  const [expanded, setExpanded] = useState(hasUserExecuted)
+  const prevHasRunning = useRef(hasRunning)
   const colors = useColors()
+
+  // When tools finish running and the expand setting is on, keep the group expanded
+  useEffect(() => {
+    if (prevHasRunning.current && !hasRunning && expandToolResults) {
+      setExpanded(true)
+    }
+    prevHasRunning.current = hasRunning
+  }, [hasRunning, expandToolResults])
 
   const isOpen = expanded || hasRunning
 
@@ -722,15 +844,7 @@ function ToolGroup({ tools, skipMotion }: { tools: Message[]; skipMotion?: boole
 
                     {/* Result badge */}
                     {!isRunning && (
-                      <span
-                        className="inline-block text-[10px] mt-0.5 px-1.5 py-[1px] rounded"
-                        style={{
-                          background: tool.toolStatus === 'error' ? colors.statusErrorBg : colors.surfaceHover,
-                          color: tool.toolStatus === 'error' ? colors.statusError : colors.textMuted,
-                        }}
-                      >
-                        Result
-                      </span>
+                      <ToolResultBadge tool={tool} colors={colors} />
                     )}
 
                     {isRunning && (
@@ -751,6 +865,7 @@ function ToolGroup({ tools, skipMotion }: { tools: Message[]; skipMotion?: boole
 
     return (
       <motion.div
+        key="expanded"
         initial={{ opacity: 0, height: 0 }}
         animate={{ opacity: 1, height: 'auto' }}
         exit={{ opacity: 0, height: 0 }}
@@ -780,6 +895,7 @@ function ToolGroup({ tools, skipMotion }: { tools: Message[]; skipMotion?: boole
 
   return (
     <motion.div
+      key="collapsed"
       initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.12 }}

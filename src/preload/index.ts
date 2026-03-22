@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { IPC } from '../shared/types'
-import type { RunOptions, NormalizedEvent, HealthReport, EnrichedError, Attachment, SessionMeta, CatalogPlugin, SessionLoadMessage } from '../shared/types'
+import type { RunOptions, NormalizedEvent, HealthReport, EnrichedError, Attachment, SessionMeta, CatalogPlugin, SessionLoadMessage, GitGraphData, GitChangesData, GitBranchInfo, PersistedTabState } from '../shared/types'
 
 export interface CluiAPI {
   // ─── Request-response (renderer → main) ───
@@ -16,6 +16,7 @@ export interface CluiAPI {
   selectDirectory(): Promise<string | null>
   openExternal(url: string): Promise<boolean>
   openInTerminal(sessionId: string | null, projectPath?: string): Promise<boolean>
+  openInVSCode(projectPath: string): Promise<boolean>
   attachFiles(): Promise<Attachment[] | null>
   takeScreenshot(): Promise<Attachment | null>
   pasteImage(dataUrl: string): Promise<Attachment | null>
@@ -26,13 +27,37 @@ export interface CluiAPI {
   resetTabSession(tabId: string): void
   listSessions(projectPath?: string): Promise<SessionMeta[]>
   loadSession(sessionId: string, projectPath?: string): Promise<SessionLoadMessage[]>
+  readPlan(filePath: string): Promise<{ content: string | null; fileName: string | null }>
   fetchMarketplace(forceRefresh?: boolean): Promise<{ plugins: CatalogPlugin[]; error: string | null }>
   listInstalledPlugins(): Promise<string[]>
   installPlugin(repo: string, pluginName: string, marketplace: string, sourcePath?: string, isSkillMd?: boolean): Promise<{ ok: boolean; error?: string }>
   uninstallPlugin(pluginName: string): Promise<{ ok: boolean; error?: string }>
-  setPermissionMode(mode: string): void
+  executeBash(id: string, command: string, cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number | null }>
+  cancelBash(id: string): void
+  setPermissionMode(tabId: string, mode: string): void
   getTheme(): Promise<{ isDark: boolean }>
   onThemeChange(callback: (isDark: boolean) => void): () => void
+  loadSettings(): Promise<Record<string, any>>
+  saveSettings(data: Record<string, any>): Promise<void>
+  loadTabs(): Promise<PersistedTabState | null>
+  saveTabs(data: PersistedTabState): Promise<void>
+
+  // ─── Git operations ───
+  gitIsRepo(directory: string): Promise<{ isRepo: boolean }>
+  gitGraph(directory: string, skip?: number, limit?: number): Promise<GitGraphData>
+  gitChanges(directory: string): Promise<GitChangesData>
+  gitCommit(directory: string, message: string): Promise<{ ok: boolean; error?: string }>
+  gitFetch(directory: string): Promise<{ ok: boolean; error?: string }>
+  gitPull(directory: string): Promise<{ ok: boolean; error?: string }>
+  gitPush(directory: string): Promise<{ ok: boolean; error?: string }>
+  gitBranches(directory: string): Promise<{ branches: GitBranchInfo[]; current: string }>
+  gitCheckout(directory: string, branch: string): Promise<{ ok: boolean; error?: string }>
+  gitCreateBranch(directory: string, name: string): Promise<{ ok: boolean; error?: string }>
+  gitDiff(directory: string, path: string, staged: boolean): Promise<{ diff: string; fileName: string }>
+  gitStage(directory: string, paths: string[]): Promise<{ ok: boolean; error?: string }>
+  gitUnstage(directory: string, paths: string[]): Promise<{ ok: boolean; error?: string }>
+  gitDiscard(directory: string, paths: string[]): Promise<{ ok: boolean; error?: string }>
+  gitDeleteBranch(directory: string, branch: string): Promise<{ ok: boolean; error?: string }>
 
   // ─── Window management ───
   resizeHeight(height: number): void
@@ -49,6 +74,7 @@ export interface CluiAPI {
   onError(callback: (tabId: string, error: EnrichedError) => void): () => void
   onSkillStatus(callback: (status: { name: string; state: string; error?: string; reason?: string }) => void): () => void
   onWindowShown(callback: () => void): () => void
+  onShowSettings(callback: () => void): () => void
 }
 
 const api: CluiAPI = {
@@ -65,6 +91,7 @@ const api: CluiAPI = {
   selectDirectory: () => ipcRenderer.invoke(IPC.SELECT_DIRECTORY),
   openExternal: (url) => ipcRenderer.invoke(IPC.OPEN_EXTERNAL, url),
   openInTerminal: (sessionId, projectPath) => ipcRenderer.invoke(IPC.OPEN_IN_TERMINAL, { sessionId, projectPath }),
+  openInVSCode: (projectPath) => ipcRenderer.invoke(IPC.OPEN_IN_VSCODE, projectPath),
   attachFiles: () => ipcRenderer.invoke(IPC.ATTACH_FILES),
   takeScreenshot: () => ipcRenderer.invoke(IPC.TAKE_SCREENSHOT),
   pasteImage: (dataUrl) => ipcRenderer.invoke(IPC.PASTE_IMAGE, dataUrl),
@@ -76,19 +103,43 @@ const api: CluiAPI = {
   resetTabSession: (tabId) => ipcRenderer.send(IPC.RESET_TAB_SESSION, tabId),
   listSessions: (projectPath?: string) => ipcRenderer.invoke(IPC.LIST_SESSIONS, projectPath),
   loadSession: (sessionId: string, projectPath?: string) => ipcRenderer.invoke(IPC.LOAD_SESSION, { sessionId, projectPath }),
+  readPlan: (filePath: string) => ipcRenderer.invoke(IPC.READ_PLAN, filePath),
   fetchMarketplace: (forceRefresh) => ipcRenderer.invoke(IPC.MARKETPLACE_FETCH, { forceRefresh }),
   listInstalledPlugins: () => ipcRenderer.invoke(IPC.MARKETPLACE_INSTALLED),
   installPlugin: (repo, pluginName, marketplace, sourcePath, isSkillMd) =>
     ipcRenderer.invoke(IPC.MARKETPLACE_INSTALL, { repo, pluginName, marketplace, sourcePath, isSkillMd }),
   uninstallPlugin: (pluginName) =>
     ipcRenderer.invoke(IPC.MARKETPLACE_UNINSTALL, { pluginName }),
-  setPermissionMode: (mode) => ipcRenderer.send(IPC.SET_PERMISSION_MODE, mode),
+  executeBash: (id, command, cwd) => ipcRenderer.invoke(IPC.EXECUTE_BASH, { id, command, cwd }),
+  cancelBash: (id) => ipcRenderer.send(IPC.CANCEL_BASH, id),
+  setPermissionMode: (tabId, mode) => ipcRenderer.send(IPC.SET_PERMISSION_MODE, { tabId, mode }),
   getTheme: () => ipcRenderer.invoke(IPC.GET_THEME),
   onThemeChange: (callback) => {
     const handler = (_e: Electron.IpcRendererEvent, isDark: boolean) => callback(isDark)
     ipcRenderer.on(IPC.THEME_CHANGED, handler)
     return () => ipcRenderer.removeListener(IPC.THEME_CHANGED, handler)
   },
+  loadSettings: () => ipcRenderer.invoke(IPC.LOAD_SETTINGS),
+  saveSettings: (data) => ipcRenderer.invoke(IPC.SAVE_SETTINGS, data),
+  loadTabs: () => ipcRenderer.invoke(IPC.LOAD_TABS),
+  saveTabs: (data) => ipcRenderer.invoke(IPC.SAVE_TABS, data),
+
+  // ─── Git operations ───
+  gitIsRepo: (directory) => ipcRenderer.invoke(IPC.GIT_IS_REPO, directory),
+  gitGraph: (directory, skip, limit) => ipcRenderer.invoke(IPC.GIT_GRAPH, { directory, skip, limit }),
+  gitChanges: (directory) => ipcRenderer.invoke(IPC.GIT_CHANGES, { directory }),
+  gitCommit: (directory, message) => ipcRenderer.invoke(IPC.GIT_COMMIT, { directory, message }),
+  gitFetch: (directory) => ipcRenderer.invoke(IPC.GIT_FETCH, { directory }),
+  gitPull: (directory) => ipcRenderer.invoke(IPC.GIT_PULL, { directory }),
+  gitPush: (directory) => ipcRenderer.invoke(IPC.GIT_PUSH, { directory }),
+  gitBranches: (directory) => ipcRenderer.invoke(IPC.GIT_BRANCHES, { directory }),
+  gitCheckout: (directory, branch) => ipcRenderer.invoke(IPC.GIT_CHECKOUT, { directory, branch }),
+  gitCreateBranch: (directory, name) => ipcRenderer.invoke(IPC.GIT_CREATE_BRANCH, { directory, name }),
+  gitDiff: (directory, path, staged) => ipcRenderer.invoke(IPC.GIT_DIFF, { directory, path, staged }),
+  gitStage: (directory, paths) => ipcRenderer.invoke(IPC.GIT_STAGE, { directory, paths }),
+  gitUnstage: (directory, paths) => ipcRenderer.invoke(IPC.GIT_UNSTAGE, { directory, paths }),
+  gitDiscard: (directory, paths) => ipcRenderer.invoke(IPC.GIT_DISCARD, { directory, paths }),
+  gitDeleteBranch: (directory, branch) => ipcRenderer.invoke(IPC.GIT_DELETE_BRANCH, { directory, branch }),
 
   // ─── Window management ───
   resizeHeight: (height) => ipcRenderer.send(IPC.RESIZE_HEIGHT, height),
@@ -137,6 +188,12 @@ const api: CluiAPI = {
     const handler = () => callback()
     ipcRenderer.on(IPC.WINDOW_SHOWN, handler)
     return () => ipcRenderer.removeListener(IPC.WINDOW_SHOWN, handler)
+  },
+
+  onShowSettings: (callback) => {
+    const handler = () => callback()
+    ipcRenderer.on(IPC.SHOW_SETTINGS, handler)
+    return () => ipcRenderer.removeListener(IPC.SHOW_SETTINGS, handler)
   },
 }
 

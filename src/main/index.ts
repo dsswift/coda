@@ -1,8 +1,11 @@
 import { app, BrowserWindow, ipcMain, dialog, screen, globalShortcut, Tray, Menu, nativeImage, nativeTheme, shell, systemPreferences } from 'electron'
 import { join } from 'path'
-import { existsSync, readdirSync, statSync, createReadStream } from 'fs'
+import { existsSync, readdirSync, statSync, createReadStream, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { unlink } from 'fs/promises'
 import { createInterface } from 'readline'
 import { homedir } from 'os'
+import { execFile as execFileCb, spawn, type ChildProcess } from 'child_process'
+import { promisify } from 'util'
 import { ControlPlane } from './claude/control-plane'
 import { ensureSkills, type SkillStatus } from './skills/installer'
 import { fetchCatalog, listInstalled, installPlugin, uninstallPlugin } from './marketplace/catalog'
@@ -10,6 +13,8 @@ import { log as _log, LOG_FILE, flushLogs } from './logger'
 import { getCliEnv } from './cli-env'
 import { IPC } from '../shared/types'
 import type { RunOptions, NormalizedEvent, EnrichedError } from '../shared/types'
+
+const gitExec = promisify(execFileCb)
 
 const DEBUG_MODE = process.env.CLUI_DEBUG === '1'
 const SPACES_DEBUG = DEBUG_MODE || process.env.CLUI_SPACES_DEBUG === '1'
@@ -28,11 +33,9 @@ const INTERACTIVE_PTY = process.env.CLUI_INTERACTIVE_PERMISSIONS_PTY === '1'
 
 const controlPlane = new ControlPlane(INTERACTIVE_PTY)
 
-// Keep native width fixed to avoid renderer animation vs setBounds race.
-// The UI itself still launches in compact mode; extra width is transparent/click-through.
-const BAR_WIDTH = 1040
-const PILL_HEIGHT = 720  // Fixed native window height — extra room for expanded UI + shadow buffers
-const PILL_BOTTOM_MARGIN = 24
+// The native window covers the full screen work area so that floating panels
+// (plan viewer, diff viewer, git panel) can be positioned anywhere without clipping.
+// The UI itself renders at the bottom center; all other regions are transparent/click-through.
 
 // ─── Broadcast to renderer ───
 
@@ -95,17 +98,13 @@ controlPlane.on('error', (tabId: string, error: EnrichedError) => {
 function createWindow(): void {
   const cursor = screen.getCursorScreenPoint()
   const display = screen.getDisplayNearestPoint(cursor)
-  const { width: screenWidth, height: screenHeight } = display.workAreaSize
-  const { x: dx, y: dy } = display.workArea
-
-  const x = dx + Math.round((screenWidth - BAR_WIDTH) / 2)
-  const y = dy + screenHeight - PILL_HEIGHT - PILL_BOTTOM_MARGIN
+  const { x: dx, y: dy, width: sw, height: sh } = display.workArea
 
   mainWindow = new BrowserWindow({
-    width: BAR_WIDTH,
-    height: PILL_HEIGHT,
-    x,
-    y,
+    width: sw,
+    height: sh,
+    x: dx,
+    y: dy,
     ...(process.platform === 'darwin' ? { type: 'panel' as const } : {}),  // NSPanel — non-activating, joins all spaces
     frame: false,
     transparent: true,
@@ -142,12 +141,38 @@ function createWindow(): void {
   })
 
   let forceQuit = false
-  app.on('before-quit', () => { forceQuit = true })
+  app.on('before-quit', (e) => {
+    if (forceQuit) return
+    e.preventDefault()
+    const hasRunning = controlPlane.hasRunningTabs()
+    const choice = dialog.showMessageBoxSync(mainWindow!, {
+      type: 'warning',
+      buttons: ['Quit', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      title: 'Quit Clui CC?',
+      message: hasRunning
+        ? 'Sessions are still running. Quitting will stop them.'
+        : 'Are you sure you want to quit?',
+      detail: 'Tip: Press ⌥Space to hide/show the app without quitting.',
+    })
+    if (choice === 0) {
+      forceQuit = true
+      if (tray) {
+        tray.destroy()
+        tray = null
+      }
+      app.quit()
+    }
+  })
   mainWindow.on('close', (e) => {
     if (!forceQuit) {
       e.preventDefault()
       mainWindow?.hide()
     }
+  })
+  mainWindow.on('closed', () => {
+    mainWindow = null
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -157,20 +182,51 @@ function createWindow(): void {
   }
 }
 
+function createTray(): void {
+  const trayIconPath = join(__dirname, '../../resources/trayTemplate.png')
+  const trayIcon = nativeImage.createFromPath(trayIconPath)
+  trayIcon.setTemplateImage(true)
+  tray = new Tray(trayIcon)
+  tray.setToolTip('Clui CC — Claude Code UI')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: 'Toggle Interface', accelerator: 'Alt+Space', click: () => toggleWindow('tray menu') },
+      { type: 'separator' },
+      { label: 'Settings...', click: () => {
+        showWindow('tray settings')
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send(IPC.SHOW_SETTINGS)
+        }
+      }},
+      { type: 'separator' },
+      { label: 'Quit', click: () => { app.quit() } },
+    ])
+  )
+}
+
+function ensureWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+  }
+  if (!tray || tray.isDestroyed()) {
+    createTray()
+  }
+}
+
 function showWindow(source = 'unknown'): void {
+  ensureWindow()
   if (!mainWindow) return
   const toggleId = ++toggleSequence
 
   // Position on the display where the cursor currently is (not always primary)
   const cursor = screen.getCursorScreenPoint()
   const display = screen.getDisplayNearestPoint(cursor)
-  const { width: sw, height: sh } = display.workAreaSize
-  const { x: dx, y: dy } = display.workArea
+  const { x: dx, y: dy, width: sw, height: sh } = display.workArea
   mainWindow.setBounds({
-    x: dx + Math.round((sw - BAR_WIDTH) / 2),
-    y: dy + sh - PILL_HEIGHT - PILL_BOTTOM_MARGIN,
-    width: BAR_WIDTH,
-    height: PILL_HEIGHT,
+    x: dx,
+    y: dy,
+    width: sw,
+    height: sh,
   })
 
   // Always re-assert space membership — the flag can be lost after hide/show cycles
@@ -191,7 +247,7 @@ function showWindow(source = 'unknown'): void {
 }
 
 function toggleWindow(source = 'unknown'): void {
-  if (!mainWindow) return
+  if (!mainWindow || mainWindow.isDestroyed()) return
   const toggleId = ++toggleSequence
   if (SPACES_DEBUG) {
     log(`[spaces] toggle#${toggleId} source=${source} start`)
@@ -207,8 +263,7 @@ function toggleWindow(source = 'unknown'): void {
 }
 
 // ─── Resize ───
-// Fixed-height mode: ignore renderer resize events to prevent jank.
-// The native window stays at PILL_HEIGHT; all expand/collapse happens inside the renderer.
+// The native window covers the full work area; all expand/collapse happens inside the renderer.
 
 ipcMain.on(IPC.RESIZE_HEIGHT, () => {
   // No-op — fixed height window, no dynamic resize
@@ -295,6 +350,13 @@ ipcMain.handle(IPC.PROMPT, async (_event, { tabId, requestId, options }: { tabId
     throw new Error('No requestId provided — prompt rejected')
   }
 
+  // Auto-register tab if it doesn't exist in the control plane
+  // (handles race conditions on first launch, process restarts, stale state)
+  if (!controlPlane.hasTab(tabId)) {
+    log(`PROMPT: tab ${tabId} not found — auto-registering`)
+    controlPlane.ensureTab(tabId)
+  }
+
   try {
     await controlPlane.submitPrompt(tabId, requestId, options)
   } catch (err: unknown) {
@@ -332,13 +394,55 @@ ipcMain.handle(IPC.CLOSE_TAB, (_event, tabId: string) => {
   controlPlane.closeTab(tabId)
 })
 
-ipcMain.on(IPC.SET_PERMISSION_MODE, (_event, mode: string) => {
-  if (mode !== 'ask' && mode !== 'auto') {
+ipcMain.on(IPC.SET_PERMISSION_MODE, (_event, payload: { tabId: string; mode: string }) => {
+  const { tabId, mode } = payload
+  if (mode !== 'ask' && mode !== 'auto' && mode !== 'plan') {
     log(`IPC SET_PERMISSION_MODE: invalid mode "${mode}" — ignoring`)
     return
   }
-  log(`IPC SET_PERMISSION_MODE: ${mode}`)
-  controlPlane.setPermissionMode(mode)
+  log(`IPC SET_PERMISSION_MODE: tab=${tabId} mode=${mode}`)
+  controlPlane.setPermissionMode(tabId, mode)
+})
+
+// ─── Bash command execution ───
+
+const bashProcesses = new Map<string, ChildProcess>()
+
+ipcMain.handle(IPC.EXECUTE_BASH, async (_event, { id, command, cwd }: { id: string; command: string; cwd: string }) => {
+  log(`IPC EXECUTE_BASH [${id}]: ${command} (cwd=${cwd})`)
+  return new Promise<{ stdout: string; stderr: string; exitCode: number | null }>((resolve) => {
+    const shell = process.env.SHELL || '/bin/bash'
+    const child = spawn(shell, ['-lc', command], { cwd, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] })
+    bashProcesses.set(id, child)
+
+    const stdoutChunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+
+    child.stdout!.on('data', (chunk: Buffer) => stdoutChunks.push(chunk))
+    child.stderr!.on('data', (chunk: Buffer) => stderrChunks.push(chunk))
+
+    child.on('close', (code) => {
+      bashProcesses.delete(id)
+      resolve({
+        stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
+        stderr: Buffer.concat(stderrChunks).toString('utf-8'),
+        exitCode: code,
+      })
+    })
+
+    child.on('error', (err) => {
+      bashProcesses.delete(id)
+      resolve({ stdout: '', stderr: err.message, exitCode: 1 })
+    })
+  })
+})
+
+ipcMain.on(IPC.CANCEL_BASH, (_event, id: string) => {
+  const child = bashProcesses.get(id)
+  if (child) {
+    log(`IPC CANCEL_BASH [${id}]: sending SIGINT`)
+    child.kill('SIGINT')
+  }
 })
 
 ipcMain.handle(IPC.RESPOND_PERMISSION, (_event, { tabId, questionId, optionId }: { tabId: string; questionId: string; optionId: string }) => {
@@ -392,11 +496,26 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
             if (obj.timestamp) meta.lastTimestamp = obj.timestamp
             if (obj.type === 'user' && !meta.firstMessage) {
               const content = obj.message?.content
+              let raw = ''
               if (typeof content === 'string') {
-                meta.firstMessage = content.substring(0, 100)
+                raw = content
               } else if (Array.isArray(content)) {
-                const textPart = content.find((p: any) => p.type === 'text')
-                meta.firstMessage = textPart?.text?.substring(0, 100) || null
+                raw = (content.find((p: any) => p.type === 'text')?.text) || ''
+              }
+              // Skip CLI internal messages, but show bash commands with ! prefix
+              if (!raw || raw.includes('<local-command-caveat') || raw.includes('<bash-stdout') || raw.includes('<bash-stderr') || raw.includes('<system-reminder') || raw.includes('<command-name')) {
+                // Skip: internal hints and output-only messages
+              } else if (raw.includes('<bash-input')) {
+                const cmd = extractTag(raw, 'bash-input')
+                if (cmd) meta.firstMessage = `! ${cmd.trim()}`.substring(0, 100)
+              } else {
+                const cleaned = cleanCliTags(raw)
+                const { bashEntries, remainder } = extractBashEntries(cleaned)
+                if (bashEntries.length > 0) {
+                  meta.firstMessage = `! ${bashEntries[0].command}`.substring(0, 100)
+                } else {
+                  meta.firstMessage = cleaned.substring(0, 100) || null
+                }
               }
             }
           } catch {}
@@ -426,6 +545,45 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
 })
 
 // Load conversation history from a session's JSONL file
+/**
+ * Clean CLI-internal XML tags from session JSONL content.
+ * Removes hidden tags entirely and strips wrapper tags from visible content.
+ */
+function cleanCliTags(text: string): string {
+  let result = text.replace(/<(?:local-command-caveat|system-reminder|command-name|command-message|command-args)[^>]*>[\s\S]*?<\/(?:local-command-caveat|system-reminder|command-name|command-message|command-args)>/g, '')
+  result = result.replace(/<\/?(?:bash-input|bash-stdout|bash-stderr)[^>]*>/g, '')
+  return result.trim()
+}
+
+/** Extract inner text from a specific XML tag, or null if not present */
+function extractTag(text: string, tag: string): string | null {
+  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`)
+  const m = text.match(re)
+  return m ? m[1] : null
+}
+
+/**
+ * Extract CLUI-prepended bash command results from a user message.
+ * Pattern: "$ command\n```\noutput\n```" optionally followed by more bash entries,
+ * then the actual user message.
+ */
+function extractBashEntries(text: string): { bashEntries: Array<{ command: string; output: string }>; remainder: string } {
+  const bashEntries: Array<{ command: string; output: string }>[] = []
+  const entries: Array<{ command: string; output: string }> = []
+  let rest = text
+
+  // Match pattern: $ command\n```\noutput\n``` (possibly with stderr blocks too)
+  const pattern = /^\$ (.+)\n```\n([\s\S]*?)\n```(?:\nstderr:\n```\n[\s\S]*?\n```)?\s*/
+  let match = rest.match(pattern)
+  while (match) {
+    entries.push({ command: match[1], output: match[2] })
+    rest = rest.slice(match[0].length)
+    match = rest.match(pattern)
+  }
+
+  return { bashEntries: entries, remainder: rest }
+}
+
 ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPath?: string } | string) => {
   const sessionId = typeof arg === 'string' ? arg : arg.sessionId
   const projectPath = typeof arg === 'string' ? undefined : arg.projectPath
@@ -436,7 +594,7 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
     const filePath = join(homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)
     if (!existsSync(filePath)) return []
 
-    const messages: Array<{ role: string; content: string; toolName?: string; timestamp: number }> = []
+    const messages: Array<{ role: string; content: string; toolName?: string; toolInput?: string; toolId?: string; userExecuted?: boolean; timestamp: number }> = []
     await new Promise<void>((resolve) => {
       const rl = createInterface({ input: createReadStream(filePath) })
       rl.on('line', (line: string) => {
@@ -444,29 +602,93 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
           const obj = JSON.parse(line)
           if (obj.type === 'user') {
             const content = obj.message?.content
-            let text = ''
+            let raw = ''
             if (typeof content === 'string') {
-              text = content
+              raw = content
             } else if (Array.isArray(content)) {
-              text = content
+              // Extract tool_result blocks and attach content to matching tool messages
+              for (const block of content) {
+                if (block.type === 'tool_result' && block.tool_use_id) {
+                  let resultText = ''
+                  if (typeof block.content === 'string') {
+                    resultText = block.content
+                  } else if (Array.isArray(block.content)) {
+                    resultText = block.content
+                      .filter((c: any) => c.type === 'text' && c.text)
+                      .map((c: any) => c.text)
+                      .join('\n')
+                  }
+                  // Find matching tool message and set its content
+                  const toolMsg = [...messages].reverse().find(
+                    (m) => m.role === 'tool' && m.toolId === block.tool_use_id
+                  )
+                  if (toolMsg) {
+                    toolMsg.content = resultText
+                  }
+                }
+              }
+              raw = content
                 .filter((b: any) => b.type === 'text')
                 .map((b: any) => b.text)
                 .join('\n')
             }
-            if (text) {
-              messages.push({ role: 'user', content: text, timestamp: new Date(obj.timestamp).getTime() })
+            const ts = new Date(obj.timestamp).getTime()
+
+            // CLI ! command messages: route by tag type
+            if (raw.includes('<local-command-caveat')) {
+              // Internal hint — discard entirely
+            } else if (raw.includes('<bash-input')) {
+              const cmd = extractTag(raw, 'bash-input') || raw
+              messages.push({ role: 'user', content: `! ${cmd.trim()}`, userExecuted: true, timestamp: ts })
+            } else if (raw.includes('<bash-stdout') || raw.includes('<bash-stderr')) {
+              // Emit as a Bash tool card so it renders like agent tool output
+              const stdout = extractTag(raw, 'bash-stdout') || ''
+              const stderr = extractTag(raw, 'bash-stderr') || ''
+              // Look back for the preceding bash-input to use as toolInput
+              const prevMsg = messages[messages.length - 1]
+              const cmdInput = prevMsg?.role === 'user' ? prevMsg.content : undefined
+              messages.push({
+                role: 'tool',
+                content: '',
+                toolName: 'Bash',
+                toolInput: cmdInput ? JSON.stringify({ command: cmdInput }) : undefined,
+                userExecuted: true,
+                timestamp: ts,
+              })
+            } else {
+              const text = cleanCliTags(raw)
+              if (text) {
+                // Detect CLUI bash command results prepended to prompts: $ cmd\n```\noutput\n```
+                const { bashEntries, remainder } = extractBashEntries(text)
+                for (const entry of bashEntries) {
+                  messages.push({ role: 'user', content: `! ${entry.command}`, userExecuted: true, timestamp: ts })
+                  messages.push({
+                    role: 'tool',
+                    content: entry.output,
+                    toolName: 'Bash',
+                    toolInput: JSON.stringify({ command: entry.command }),
+                    userExecuted: true,
+                    timestamp: ts,
+                  })
+                }
+                if (remainder.trim()) {
+                  messages.push({ role: 'user', content: remainder.trim(), timestamp: ts })
+                }
+              }
             }
           } else if (obj.type === 'assistant') {
             const content = obj.message?.content
             if (Array.isArray(content)) {
               for (const block of content) {
                 if (block.type === 'text' && block.text) {
-                  messages.push({ role: 'assistant', content: block.text, timestamp: new Date(obj.timestamp).getTime() })
+                  messages.push({ role: 'assistant', content: cleanCliTags(block.text), timestamp: new Date(obj.timestamp).getTime() })
                 } else if (block.type === 'tool_use' && block.name) {
                   messages.push({
                     role: 'tool',
                     content: '',
                     toolName: block.name,
+                    toolId: block.id,
+                    toolInput: block.input ? JSON.stringify(block.input) : undefined,
                     timestamp: new Date(obj.timestamp).getTime(),
                   })
                 }
@@ -484,13 +706,25 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
   }
 })
 
+ipcMain.handle(IPC.READ_PLAN, async (_e, filePath: string) => {
+  try {
+    if (!filePath || !existsSync(filePath)) return { content: null, fileName: null }
+    const content = readFileSync(filePath, 'utf-8')
+    const fileName = filePath.split('/').pop() || filePath
+    return { content, fileName }
+  } catch (err) {
+    log(`READ_PLAN error: ${err}`)
+    return { content: null, fileName: null }
+  }
+})
+
 ipcMain.handle(IPC.SELECT_DIRECTORY, async () => {
   if (!mainWindow) return null
   // macOS: activate app so unparented dialog appears on top (not behind other apps).
   // Unparented avoids modal dimming on the transparent overlay.
   // Activation is fine here — user is actively interacting with CLUI.
   if (process.platform === 'darwin') app.focus()
-  const options = { properties: ['openDirectory'] as const }
+  const options = { properties: ['openDirectory' as const] }
   const result = process.platform === 'darwin'
     ? await dialog.showOpenDialog(options)
     : await dialog.showOpenDialog(mainWindow, options)
@@ -513,7 +747,7 @@ ipcMain.handle(IPC.ATTACH_FILES, async () => {
   // macOS: activate app so unparented dialog appears on top
   if (process.platform === 'darwin') app.focus()
   const options = {
-    properties: ['openFile', 'multiSelections'],
+    properties: ['openFile' as const, 'multiSelections' as const],
     filters: [
       { name: 'All Files', extensions: ['*'] },
       { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
@@ -868,6 +1102,29 @@ end tell`
   }
 })
 
+ipcMain.handle(IPC.OPEN_IN_VSCODE, (_event, projectPath: string) => {
+  const { execFile } = require('child_process')
+  const dir = projectPath || process.cwd()
+
+  try {
+    execFile('code', ['--reuse-window', dir], (err: Error | null) => {
+      if (err) {
+        log(`'code' CLI failed, falling back to open -a: ${err.message}`)
+        execFile('/usr/bin/open', ['-a', 'Visual Studio Code', dir], (err2: Error | null) => {
+          if (err2) log(`Failed to open VS Code: ${err2.message}`)
+          else log(`Opened VS Code (via open -a) at: ${dir}`)
+        })
+      } else {
+        log(`Opened VS Code at: ${dir}`)
+      }
+    })
+    return true
+  } catch (err: unknown) {
+    log(`Failed to open VS Code: ${err}`)
+    return false
+  }
+})
+
 // ─── Marketplace IPC ───
 
 ipcMain.handle(IPC.MARKETPLACE_FETCH, async (_event, { forceRefresh } = {}) => {
@@ -888,6 +1145,358 @@ ipcMain.handle(IPC.MARKETPLACE_INSTALL, async (_event, { repo, pluginName, marke
 ipcMain.handle(IPC.MARKETPLACE_UNINSTALL, async (_event, { pluginName }: { pluginName: string }) => {
   log(`IPC MARKETPLACE_UNINSTALL: ${pluginName}`)
   return uninstallPlugin(pluginName)
+})
+
+// ─── Settings Persistence ───
+
+const SETTINGS_DIR = join(homedir(), '.clui')
+const SETTINGS_FILE = join(SETTINGS_DIR, 'settings.json')
+const SETTINGS_DEFAULTS = { themeMode: 'dark', soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', showDirLabel: false, preferredOpenWith: 'cli', showImplementClearContext: false, expandToolResults: false }
+
+ipcMain.handle(IPC.LOAD_SETTINGS, () => {
+  try {
+    if (existsSync(SETTINGS_FILE)) {
+      return { ...SETTINGS_DEFAULTS, ...JSON.parse(readFileSync(SETTINGS_FILE, 'utf-8')) }
+    }
+  } catch (err) {
+    log(`Failed to load settings: ${err}`)
+  }
+  return SETTINGS_DEFAULTS
+})
+
+ipcMain.handle(IPC.SAVE_SETTINGS, (_event, data: Record<string, unknown>) => {
+  try {
+    if (!existsSync(SETTINGS_DIR)) mkdirSync(SETTINGS_DIR, { recursive: true })
+    writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2))
+  } catch (err) {
+    log(`Failed to save settings: ${err}`)
+  }
+})
+
+// ─── Tab Persistence ───
+
+const TABS_FILE = join(SETTINGS_DIR, 'tabs.json')
+
+ipcMain.handle(IPC.LOAD_TABS, () => {
+  try {
+    if (existsSync(TABS_FILE)) {
+      return JSON.parse(readFileSync(TABS_FILE, 'utf-8'))
+    }
+  } catch (err) {
+    log(`Failed to load tabs: ${err}`)
+  }
+  return null
+})
+
+ipcMain.handle(IPC.SAVE_TABS, (_event, data: Record<string, unknown>) => {
+  try {
+    if (!existsSync(SETTINGS_DIR)) mkdirSync(SETTINGS_DIR, { recursive: true })
+    writeFileSync(TABS_FILE, JSON.stringify(data, null, 2))
+  } catch (err) {
+    log(`Failed to save tabs: ${err}`)
+  }
+})
+
+// ─── Git IPC Handlers ───
+
+async function runGit(directory: string, args: string[]): Promise<string> {
+  try {
+    const { stdout } = await gitExec('git', args, { cwd: directory, maxBuffer: 10 * 1024 * 1024 })
+    return stdout
+  } catch (err: any) {
+    throw new Error(err.stderr?.trim() || err.message)
+  }
+}
+
+ipcMain.handle(IPC.GIT_IS_REPO, async (_event, directory: string) => {
+  try {
+    await runGit(directory, ['rev-parse', '--is-inside-work-tree'])
+    return { isRepo: true }
+  } catch {
+    return { isRepo: false }
+  }
+})
+
+ipcMain.handle(IPC.GIT_GRAPH, async (_event, { directory, skip = 0, limit = 100 }: { directory: string; skip?: number; limit?: number }) => {
+  try {
+    await runGit(directory, ['rev-parse', '--is-inside-work-tree'])
+  } catch {
+    return { commits: [], isGitRepo: false, totalCount: 0 }
+  }
+
+  try {
+    const format = '%h%x00%H%x00%P%x00%an%x00%aI%x00%s%x00%D'
+    const logOutput = await runGit(directory, [
+      'log', '--all', `--format=${format}`, '--topo-order',
+      `--skip=${skip}`, `-n`, `${limit}`,
+    ])
+
+    let totalCount = 0
+    try {
+      const countOutput = await runGit(directory, ['rev-list', '--all', '--count'])
+      totalCount = parseInt(countOutput.trim(), 10) || 0
+    } catch {}
+
+    const commits = logOutput.trim().split('\n').filter(Boolean).map((line) => {
+      const [hash, fullHash, parents, authorName, authorDate, subject, decorations] = line.split('\x00')
+      const refs: Array<{ name: string; type: 'head' | 'remote' | 'tag'; isCurrent: boolean }> = []
+      if (decorations && decorations.trim()) {
+        for (const dec of decorations.split(',')) {
+          const d = dec.trim()
+          if (!d) continue
+          if (d.startsWith('HEAD -> ')) {
+            refs.push({ name: d.replace('HEAD -> ', ''), type: 'head', isCurrent: true })
+          } else if (d.startsWith('tag: ')) {
+            refs.push({ name: d.replace('tag: ', ''), type: 'tag', isCurrent: false })
+          } else if (d.includes('/')) {
+            refs.push({ name: d, type: 'remote', isCurrent: false })
+          } else if (d !== 'HEAD') {
+            refs.push({ name: d, type: 'head', isCurrent: false })
+          }
+        }
+      }
+      return {
+        hash,
+        fullHash,
+        parents: parents ? parents.split(' ') : [],
+        authorName,
+        authorDate,
+        subject,
+        refs,
+      }
+    })
+
+    return { commits, isGitRepo: true, totalCount }
+  } catch {
+    return { commits: [], isGitRepo: true, totalCount: 0 }
+  }
+})
+
+ipcMain.handle(IPC.GIT_CHANGES, async (_event, { directory }: { directory: string }) => {
+  try {
+    await runGit(directory, ['rev-parse', '--is-inside-work-tree'])
+  } catch {
+    return { files: [], branch: '', isGitRepo: false }
+  }
+
+  let branch = ''
+  try {
+    branch = (await runGit(directory, ['branch', '--show-current'])).trim()
+  } catch {}
+
+  try {
+    const statusOutput = await runGit(directory, ['status', '--porcelain=v1', '-uall'])
+
+    // A file can appear twice if it has both staged and unstaged changes
+    // Split into staged and unstaged entries
+    const result: Array<{ path: string; status: 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked'; staged: boolean; oldPath?: string }> = []
+    // Do NOT trim() the output — leading spaces are status codes (X=' ' means not staged)
+    for (const line of statusOutput.split('\n').filter((l) => l.length >= 4)) {
+      // Porcelain v1 format: XY PATH — use regex to robustly extract status and path
+      const match = line.match(/^(.)(.) (.+)$/)
+      if (!match) continue
+      const x = match[1]
+      const y = match[2]
+      let filePath = match[3]
+      let oldPath: string | undefined
+      if (filePath.includes(' -> ')) {
+        const parts = filePath.split(' -> ')
+        oldPath = parts[0]
+        filePath = parts[1]
+      }
+
+      // Staged change
+      if (x !== ' ' && x !== '?' && x !== '!') {
+        let status: 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked'
+        if (x === 'A') status = 'added'
+        else if (x === 'D') status = 'deleted'
+        else if (x === 'R') status = 'renamed'
+        else status = 'modified'
+        result.push({ path: filePath, status, staged: true, oldPath })
+      }
+      // Unstaged change
+      if (y !== ' ' && y !== '!') {
+        let status: 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked'
+        if (y === '?') status = 'untracked'
+        else if (y === 'A') status = 'added'
+        else if (y === 'D') status = 'deleted'
+        else if (y === 'R') status = 'renamed'
+        else status = 'modified'
+        result.push({ path: filePath, status, staged: false, oldPath })
+      }
+    }
+
+    return { files: result, branch, isGitRepo: true }
+  } catch {
+    return { files: [], branch, isGitRepo: true }
+  }
+})
+
+ipcMain.handle(IPC.GIT_COMMIT, async (_event, { directory, message }: { directory: string; message: string }) => {
+  try {
+    await runGit(directory, ['commit', '-m', message])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_FETCH, async (_event, { directory }: { directory: string }) => {
+  try {
+    await runGit(directory, ['fetch', '--all'])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_PULL, async (_event, { directory }: { directory: string }) => {
+  try {
+    await runGit(directory, ['pull'])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_PUSH, async (_event, { directory }: { directory: string }) => {
+  try {
+    await runGit(directory, ['push'])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_BRANCHES, async (_event, { directory }: { directory: string }) => {
+  try {
+    const output = await runGit(directory, [
+      'branch', '-a', '--format=%(refname:short)%x00%(HEAD)%x00%(upstream:short)',
+    ])
+    let current = ''
+    const branches: Array<{ name: string; isCurrent: boolean; upstream: string | null; isRemote: boolean }> = []
+    for (const line of output.trim().split('\n').filter(Boolean)) {
+      const [name, head, upstream] = line.split('\x00')
+      const isCurrent = head === '*'
+      if (isCurrent) current = name
+      const isRemote = name.startsWith('origin/') || name.includes('/')
+      branches.push({ name, isCurrent, upstream: upstream || null, isRemote })
+    }
+    return { branches, current }
+  } catch (err: any) {
+    return { branches: [], current: '' }
+  }
+})
+
+ipcMain.handle(IPC.GIT_CHECKOUT, async (_event, { directory, branch }: { directory: string; branch: string }) => {
+  try {
+    await runGit(directory, ['checkout', branch])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_CREATE_BRANCH, async (_event, { directory, name }: { directory: string; name: string }) => {
+  try {
+    await runGit(directory, ['checkout', '-b', name])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_DIFF, async (_event, { directory, path, staged }: { directory: string; path: string; staged: boolean }) => {
+  const { basename } = require('path')
+  try {
+    let diff: string
+    if (staged) {
+      diff = await runGit(directory, ['diff', '--cached', '--', path])
+    } else {
+      // Try normal diff first
+      diff = await runGit(directory, ['diff', '--', path])
+      // If empty, might be untracked - read file contents
+      if (!diff.trim()) {
+        try {
+          const { readFileSync } = require('fs')
+          const { join } = require('path')
+          const fullPath = join(directory, path)
+          const content = readFileSync(fullPath, 'utf-8')
+          const lines = content.split('\n')
+          diff = `--- /dev/null\n+++ b/${path}\n@@ -0,0 +1,${lines.length} @@\n` +
+            lines.map((l: string) => `+${l}`).join('\n')
+        } catch {
+          diff = ''
+        }
+      }
+    }
+    return { diff, fileName: basename(path) }
+  } catch (err: any) {
+    return { diff: '', fileName: basename(path) }
+  }
+})
+
+ipcMain.handle(IPC.GIT_STAGE, async (_event, { directory, paths }: { directory: string; paths: string[] }) => {
+  try {
+    await runGit(directory, ['add', '--', ...paths])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_UNSTAGE, async (_event, { directory, paths }: { directory: string; paths: string[] }) => {
+  try {
+    await runGit(directory, ['restore', '--staged', '--', ...paths])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_DISCARD, async (_event, { directory, paths }: { directory: string; paths: string[] }) => {
+  try {
+    // Separate tracked and untracked files
+    const statusOutput = await runGit(directory, ['status', '--porcelain=v1', '-uall', '--', ...paths])
+    const trackedPaths: string[] = []
+    const untrackedPaths: string[] = []
+    for (const line of statusOutput.split('\n').filter((l) => l.length >= 4)) {
+      const dm = line.match(/^(.)(.) (.+)$/)
+      if (!dm) continue
+      const x = dm[1]
+      const y = dm[2]
+      let p = dm[3]
+      if (p.includes(' -> ')) p = p.split(' -> ')[1]
+      if (x === '?' && y === '?') {
+        untrackedPaths.push(p)
+      } else {
+        trackedPaths.push(p)
+      }
+    }
+    if (trackedPaths.length > 0) {
+      await runGit(directory, ['checkout', 'HEAD', '--', ...trackedPaths])
+    }
+    if (untrackedPaths.length > 0) {
+      const { join } = require('path')
+      for (const p of untrackedPaths) {
+        try {
+          await unlink(join(directory, p))
+        } catch {}
+      }
+    }
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_DELETE_BRANCH, async (_event, { directory, branch }: { directory: string; branch: string }) => {
+  try {
+    await runGit(directory, ['branch', '-d', branch])
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
 })
 
 // ─── Theme Detection ───
@@ -980,18 +1589,7 @@ app.whenReady().then(async () => {
   }
   globalShortcut.register('CommandOrControl+Shift+K', () => toggleWindow('shortcut Cmd/Ctrl+Shift+K'))
 
-  const trayIconPath = join(__dirname, '../../resources/trayTemplate.png')
-  const trayIcon = nativeImage.createFromPath(trayIconPath)
-  trayIcon.setTemplateImage(true)
-  tray = new Tray(trayIcon)
-  tray.setToolTip('Clui CC — Claude Code UI')
-  tray.on('click', () => toggleWindow('tray click'))
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: 'Show Clui CC', click: () => showWindow('tray menu') },
-      { label: 'Quit', click: () => { app.quit() } },
-    ])
-  )
+  createTray()
 
   // app 'activate' fires when macOS brings the app to the foreground (e.g. after
   // webContents.focus() triggers applicationDidBecomeActive on some macOS versions).
@@ -1003,6 +1601,10 @@ app.whenReady().then(async () => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
   controlPlane.shutdown()
+  if (tray) {
+    tray.destroy()
+    tray = null
+  }
   flushLogs()
 })
 

@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, CatalogPlugin, PluginStatus } from '../../shared/types'
+import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, CatalogPlugin, PluginStatus, PersistedTabState } from '../../shared/types'
 import { useThemeStore } from '../theme'
 import notificationSrc from '../../../resources/notification.mp3'
 
@@ -30,8 +30,10 @@ interface State {
   staticInfo: StaticInfo | null
   /** User's preferred model override (null = use default) */
   preferredModel: string | null
-  /** Global permission mode: 'ask' shows cards, 'auto' auto-approves all tool calls */
-  permissionMode: 'ask' | 'auto'
+  /** Whether the git side panel is open */
+  gitPanelOpen: boolean
+  /** Whether tab restoration has completed (prevents placeholder flash) */
+  tabsReady: boolean
 
   // Marketplace state
   marketplaceOpen: boolean
@@ -46,14 +48,19 @@ interface State {
   // Actions
   initStaticInfo: () => Promise<void>
   setPreferredModel: (model: string | null) => void
-  setPermissionMode: (mode: 'ask' | 'auto') => void
+  setPermissionMode: (mode: 'ask' | 'auto' | 'plan') => void
   createTab: () => Promise<string>
   selectTab: (tabId: string) => void
   closeTab: (tabId: string) => void
+  reorderTabs: (reorderedTabs: TabState[]) => void
+  renameTab: (tabId: string, customTitle: string | null) => void
+  setTabPillColor: (tabId: string, color: string | null) => void
   clearTab: () => void
   toggleExpanded: () => void
   toggleMarketplace: () => void
   closeMarketplace: () => void
+  toggleGitPanel: () => void
+  closeGitPanel: () => void
   loadMarketplace: (forceRefresh?: boolean) => Promise<void>
   setMarketplaceSearch: (query: string) => void
   setMarketplaceFilter: (filter: string) => void
@@ -62,6 +69,8 @@ interface State {
   buildYourOwn: () => void
   resumeSession: (sessionId: string, title?: string, projectPath?: string) => Promise<string>
   addSystemMessage: (content: string) => void
+  startBashCommand: (command: string) => string
+  completeBashCommand: (toolMsgId: string, command: string, stdout: string, stderr: string, exitCode: number | null) => void
   sendMessage: (prompt: string, projectPath?: string) => void
   respondPermission: (tabId: string, questionId: string, optionId: string) => void
   addDirectory: (dir: string) => void
@@ -106,6 +115,7 @@ function makeLocalTab(): TabState {
     attachments: [],
     messages: [],
     title: 'New Tab',
+    customTitle: null,
     lastResult: null,
     sessionModel: null,
     sessionTools: [],
@@ -116,6 +126,9 @@ function makeLocalTab(): TabState {
     workingDirectory: '~',
     hasChosenDirectory: false,
     additionalDirs: [],
+    permissionMode: useThemeStore.getState().defaultPermissionMode,
+    bashResults: [],
+    pillColor: null,
   }
 }
 
@@ -127,7 +140,8 @@ export const useSessionStore = create<State>((set, get) => ({
   isExpanded: false,
   staticInfo: null,
   preferredModel: null,
-  permissionMode: 'ask',
+  gitPanelOpen: false,
+  tabsReady: false,
 
   // Marketplace
   marketplaceOpen: false,
@@ -159,18 +173,27 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   setPermissionMode: (mode) => {
-    set({ permissionMode: mode })
-    window.clui.setPermissionMode(mode)
+    const { activeTabId } = get()
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === activeTabId ? { ...t, permissionMode: mode } : t
+      ),
+    }))
+    window.clui.setPermissionMode(activeTabId, mode)
   },
 
   createTab: async () => {
     const homeDir = get().staticInfo?.homePath || '~'
+    const defaultBase = useThemeStore.getState().defaultBaseDirectory
+    const startDir = defaultBase || homeDir
+    const hasChosen = !!defaultBase
     try {
       const { tabId } = await window.clui.createTab()
       const tab: TabState = {
         ...makeLocalTab(),
         id: tabId,
-        workingDirectory: homeDir,
+        workingDirectory: startDir,
+        hasChosenDirectory: hasChosen,
       }
       set((s) => ({
         tabs: [...s.tabs, tab],
@@ -179,7 +202,8 @@ export const useSessionStore = create<State>((set, get) => ({
       return tabId
     } catch {
       const tab = makeLocalTab()
-      tab.workingDirectory = homeDir
+      tab.workingDirectory = startDir
+      tab.hasChosenDirectory = hasChosen
       set((s) => ({
         tabs: [...s.tabs, tab],
         activeTabId: tab.id,
@@ -202,9 +226,11 @@ export const useSessionStore = create<State>((set, get) => ({
           : prev.tabs,
       }))
     } else {
-      // Switching to a different tab: mark as read
+      // Switching to a different tab: mark as read, auto-expand if setting enabled
+      const expandOnSwitch = useThemeStore.getState().expandOnTabSwitch
       set((prev) => ({
         activeTabId: tabId,
+        isExpanded: expandOnSwitch ? true : prev.isExpanded,
         marketplaceOpen: false,
         tabs: prev.tabs.map((t) =>
           t.id === tabId ? { ...t, hasUnread: false } : t
@@ -238,6 +264,14 @@ export const useSessionStore = create<State>((set, get) => ({
 
   closeMarketplace: () => {
     set({ marketplaceOpen: false })
+  },
+
+  toggleGitPanel: () => {
+    set((s) => ({ gitPanelOpen: !s.gitPanelOpen }))
+  },
+
+  closeGitPanel: () => {
+    set({ gitPanelOpen: false })
   },
 
   loadMarketplace: async (forceRefresh) => {
@@ -327,8 +361,13 @@ export const useSessionStore = create<State>((set, get) => ({
 
     if (s.activeTabId === tabId) {
       if (remaining.length === 0) {
+        const homeDir = get().staticInfo?.homePath || '~'
+        const defaultBase = useThemeStore.getState().defaultBaseDirectory
+        const startDir = defaultBase || homeDir
         const newTab = makeLocalTab()
-        set({ tabs: [newTab], activeTabId: newTab.id })
+        newTab.workingDirectory = startDir
+        newTab.hasChosenDirectory = !!defaultBase
+        set({ tabs: [newTab], activeTabId: newTab.id, gitPanelOpen: false })
         return
       }
       const closedIndex = s.tabs.findIndex((t) => t.id === tabId)
@@ -337,6 +376,26 @@ export const useSessionStore = create<State>((set, get) => ({
     } else {
       set({ tabs: remaining })
     }
+  },
+
+  reorderTabs: (reorderedTabs) => {
+    set({ tabs: reorderedTabs })
+  },
+
+  renameTab: (tabId, customTitle) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, customTitle } : t
+      ),
+    }))
+  },
+
+  setTabPillColor: (tabId, color) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, pillColor: color } : t
+      ),
+    }))
   },
 
   clearTab: () => {
@@ -362,9 +421,18 @@ export const useSessionStore = create<State>((set, get) => ({
         role: m.role as Message['role'],
         content: m.content,
         toolName: m.toolName,
+        toolId: m.toolId,
+        toolInput: m.toolInput,
         toolStatus: m.toolName ? 'completed' as const : undefined,
+        userExecuted: m.userExecuted,
         timestamp: m.timestamp,
       }))
+
+      // Restore plan-ready state if last tool message was ExitPlanMode
+      const lastToolMsg = [...messages].reverse().find((m) => m.toolName)
+      const restoredDenied = lastToolMsg?.toolName === 'ExitPlanMode'
+        ? { tools: [{ toolName: 'ExitPlanMode', toolUseId: 'restored' }] }
+        : null
 
       const tab: TabState = {
         ...makeLocalTab(),
@@ -374,6 +442,7 @@ export const useSessionStore = create<State>((set, get) => ({
         workingDirectory: defaultDir,
         hasChosenDirectory: !!projectPath,
         messages,
+        permissionDenied: restoredDenied,
       }
       set((s) => ({
         tabs: [...s.tabs, tab],
@@ -411,6 +480,52 @@ export const useSessionStore = create<State>((set, get) => ({
             }
           : t
       ),
+    }))
+  },
+
+  startBashCommand: (command) => {
+    const { activeTabId } = get()
+    const toolMsgId = nextMsgId()
+    const now = Date.now()
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        if (t.id !== activeTabId) return t
+        const title = t.messages.length === 0
+          ? (command.length > 30 ? command.substring(0, 27) + '...' : command)
+          : t.title
+        return {
+          ...t,
+          title,
+          messages: [
+            ...t.messages,
+            { id: nextMsgId(), role: 'user' as const, content: `! ${command}`, userExecuted: true, timestamp: now },
+            { id: toolMsgId, role: 'tool' as const, content: '', toolName: 'Bash', toolInput: JSON.stringify({ command }), toolStatus: 'running' as const, userExecuted: true, timestamp: now },
+          ],
+        }
+      }),
+    }))
+    return toolMsgId
+  },
+
+  completeBashCommand: (toolMsgId, command, stdout, stderr, exitCode) => {
+    const { activeTabId } = get()
+    const outputParts: string[] = []
+    if (stdout) outputParts.push(stdout.trimEnd())
+    if (stderr) outputParts.push(`stderr: ${stderr.trimEnd()}`)
+    if (exitCode !== null && exitCode !== 0) outputParts.push(`exit code: ${exitCode}`)
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        if (t.id !== activeTabId) return t
+        return {
+          ...t,
+          bashResults: [...t.bashResults, { command, stdout, stderr }],
+          messages: t.messages.map((m) =>
+            m.id === toolMsgId
+              ? { ...m, content: outputParts.join('\n'), toolStatus: 'completed' as const }
+              : m
+          ),
+        }
+      }),
     }))
   },
 
@@ -531,13 +646,22 @@ export const useSessionStore = create<State>((set, get) => ({
     const isBusy = tab.status === 'running'
     const requestId = crypto.randomUUID()
 
-    // Build full prompt with attachment context
+    // Build full prompt with bash results and attachment context
     let fullPrompt = prompt
+    if (tab.bashResults.length > 0) {
+      const bashCtx = tab.bashResults.map((b) => {
+        const parts = [`$ ${b.command}`]
+        if (b.stdout) parts.push('```\n' + b.stdout.trimEnd() + '\n```')
+        if (b.stderr) parts.push('stderr:\n```\n' + b.stderr.trimEnd() + '\n```')
+        return parts.join('\n')
+      }).join('\n\n')
+      fullPrompt = bashCtx + '\n\n' + fullPrompt
+    }
     if (tab.attachments.length > 0) {
       const attachmentCtx = tab.attachments
         .map((a) => `[Attached ${a.type}: ${a.path}]`)
         .join('\n')
-      fullPrompt = `${attachmentCtx}\n\n${prompt}`
+      fullPrompt = `${attachmentCtx}\n\n${fullPrompt}`
     }
 
     const title = tab.messages.length === 0
@@ -563,6 +687,7 @@ export const useSessionStore = create<State>((set, get) => ({
             ...withEffectiveBase,
             title,
             attachments: [],
+            bashResults: [],
             queuedPrompts: [...withEffectiveBase.queuedPrompts, prompt],
           }
         }
@@ -573,6 +698,8 @@ export const useSessionStore = create<State>((set, get) => ({
           currentActivity: 'Starting...',
           title,
           attachments: [],
+          bashResults: [],
+          permissionDenied: null,
           messages: [
             ...withEffectiveBase.messages,
             { id: nextMsgId(), role: 'user' as const, content: prompt, timestamp: Date.now() },
@@ -659,6 +786,7 @@ export const useSessionStore = create<State>((set, get) => ({
                 role: 'tool',
                 content: '',
                 toolName: event.toolName,
+                toolId: event.toolId,
                 toolInput: '',
                 toolStatus: 'running',
                 timestamp: Date.now(),
@@ -683,6 +811,22 @@ export const useSessionStore = create<State>((set, get) => ({
               runningTool.toolStatus = 'completed'
             }
             updated.messages = msgs2
+            break
+          }
+
+          case 'tool_result': {
+            const msgs3 = [...updated.messages]
+            const targetTool = [...msgs3].reverse().find((m) => m.role === 'tool' && m.toolId === event.toolId)
+            if (targetTool) {
+              targetTool.content = event.content
+              if (event.isError && targetTool.toolName !== 'ExitPlanMode' && targetTool.toolName !== 'AskUserQuestion') {
+                targetTool.toolStatus = 'error'
+              }
+              if (useThemeStore.getState().expandToolResults && ['Write', 'Edit', 'NotebookEdit'].includes(targetTool.toolName || '')) {
+                targetTool.autoExpandResult = true
+              }
+            }
+            updated.messages = msgs3
             break
           }
 
@@ -735,6 +879,15 @@ export const useSessionStore = create<State>((set, get) => ({
                         timestamp: Date.now(),
                       },
                     ]
+                  } else if (block.input) {
+                    // Ensure toolInput has complete data from the assembled assistant message
+                    // (streaming tool_call_update events may have been incomplete)
+                    const completeInput = JSON.stringify(block.input, null, 2)
+                    if (exists.toolInput !== completeInput) {
+                      updated.messages = updated.messages.map((m) =>
+                        m === exists ? { ...m, toolInput: completeInput } : m
+                      )
+                    }
                   }
                 }
               }
@@ -904,3 +1057,37 @@ export const useSessionStore = create<State>((set, get) => ({
     }))
   },
 }))
+
+// ─── Real-time tab persistence ───
+
+function persistTabs(): void {
+  const { tabs, activeTabId } = useSessionStore.getState()
+  const activeTab = tabs.find((t) => t.id === activeTabId)
+  const persistedTabs = tabs
+    .filter((t) => t.claudeSessionId)
+    .map((t) => ({
+      claudeSessionId: t.claudeSessionId!,
+      title: t.customTitle || t.title,
+      customTitle: t.customTitle,
+      workingDirectory: t.workingDirectory,
+      hasChosenDirectory: t.hasChosenDirectory,
+      additionalDirs: t.additionalDirs,
+      permissionMode: t.permissionMode,
+      ...(t.bashResults.length > 0 ? { bashResults: t.bashResults } : {}),
+      ...(t.pillColor ? { pillColor: t.pillColor } : {}),
+    }))
+
+  const data: PersistedTabState = {
+    activeSessionId: activeTab?.claudeSessionId || null,
+    tabs: persistedTabs,
+  }
+  window.clui.saveTabs(data)
+}
+
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+useSessionStore.subscribe((state, prev) => {
+  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId) {
+    if (saveTimer) clearTimeout(saveTimer)
+    saveTimer = setTimeout(persistTabs, 100)
+  }
+})

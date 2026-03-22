@@ -1,10 +1,10 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Terminal, CaretDown, Check, FolderOpen, Plus, X, ShieldCheck } from '@phosphor-icons/react'
+import { Terminal, CaretDown, Check, FolderOpen, Plus, X, ShieldCheck, ListChecks, GitBranch, Code } from '@phosphor-icons/react'
 import { useSessionStore, AVAILABLE_MODELS } from '../stores/sessionStore'
 import { usePopoverLayer } from './PopoverLayer'
-import { useColors } from '../theme'
+import { useColors, useThemeStore } from '../theme'
 
 /* ─── Model Picker (inline — tightly coupled to StatusBar) ─── */
 
@@ -128,10 +128,12 @@ function ModelPicker() {
   )
 }
 
-/* ─── Permission Mode Picker (global — affects all tabs) ─── */
+/* ─── Permission Mode Picker (per-tab) ─── */
 
 function PermissionModePicker() {
-  const permissionMode = useSessionStore((s) => s.permissionMode)
+  const permissionMode = useSessionStore(
+    (s) => s.tabs.find((t) => t.id === s.activeTabId)?.permissionMode ?? 'plan'
+  )
   const setPermissionMode = useSessionStore((s) => s.setPermissionMode)
   const popoverLayer = usePopoverLayer()
   const colors = useColors()
@@ -167,7 +169,10 @@ function PermissionModePicker() {
     setOpen((o) => !o)
   }
 
-  const isAuto = permissionMode === 'auto'
+  const modeLabel = permissionMode === 'plan' ? 'Plan' : permissionMode === 'auto' ? 'Auto' : 'Ask'
+  const modeIcon = permissionMode === 'plan'
+    ? <ListChecks size={11} weight="bold" />
+    : <ShieldCheck size={11} weight={permissionMode === 'auto' ? 'fill' : 'regular'} />
 
   return (
     <>
@@ -179,10 +184,10 @@ function PermissionModePicker() {
           color: colors.textTertiary,
           cursor: 'pointer',
         }}
-        title="Permission mode (global)"
+        title="Permission mode (this tab)"
       >
-        <ShieldCheck size={11} weight={isAuto ? 'fill' : 'regular'} />
-        {isAuto ? 'Auto' : 'Ask'}
+        {modeIcon}
+        {modeLabel}
         <CaretDown size={10} style={{ opacity: 0.6 }} />
       </button>
 
@@ -213,15 +218,32 @@ function PermissionModePicker() {
               onClick={() => { setPermissionMode('ask'); setOpen(false) }}
               className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] transition-colors"
               style={{
-                color: !isAuto ? colors.textPrimary : colors.textSecondary,
-                fontWeight: !isAuto ? 600 : 400,
+                color: permissionMode === 'ask' ? colors.textPrimary : colors.textSecondary,
+                fontWeight: permissionMode === 'ask' ? 600 : 400,
               }}
             >
               <span className="flex items-center gap-1.5">
                 <ShieldCheck size={12} />
                 Ask
               </span>
-              {!isAuto && <Check size={12} style={{ color: colors.accent }} />}
+              {permissionMode === 'ask' && <Check size={12} style={{ color: colors.accent }} />}
+            </button>
+
+            <div className="mx-2 my-0.5" style={{ height: 1, background: colors.popoverBorder }} />
+
+            <button
+              onClick={() => { setPermissionMode('plan'); setOpen(false) }}
+              className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] transition-colors"
+              style={{
+                color: permissionMode === 'plan' ? colors.textPrimary : colors.textSecondary,
+                fontWeight: permissionMode === 'plan' ? 600 : 400,
+              }}
+            >
+              <span className="flex items-center gap-1.5">
+                <ListChecks size={12} weight="bold" />
+                Plan
+              </span>
+              {permissionMode === 'plan' && <Check size={12} style={{ color: colors.accent }} />}
             </button>
 
             <div className="mx-2 my-0.5" style={{ height: 1, background: colors.popoverBorder }} />
@@ -230,16 +252,155 @@ function PermissionModePicker() {
               onClick={() => { setPermissionMode('auto'); setOpen(false) }}
               className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] transition-colors"
               style={{
-                color: isAuto ? colors.textPrimary : colors.textSecondary,
-                fontWeight: isAuto ? 600 : 400,
+                color: permissionMode === 'auto' ? colors.textPrimary : colors.textSecondary,
+                fontWeight: permissionMode === 'auto' ? 600 : 400,
               }}
             >
               <span className="flex items-center gap-1.5">
                 <ShieldCheck size={12} weight="fill" />
                 Auto
               </span>
-              {isAuto && <Check size={12} style={{ color: colors.accent }} />}
+              {permissionMode === 'auto' && <Check size={12} style={{ color: colors.accent }} />}
             </button>
+          </div>
+        </motion.div>,
+        popoverLayer,
+      )}
+    </>
+  )
+}
+
+/* ─── Open With Picker ─── */
+
+const OPEN_WITH_OPTIONS = [
+  { id: 'cli' as const, label: 'Open in CLI', icon: Terminal },
+  { id: 'vscode' as const, label: 'Open in VS Code', icon: Code },
+]
+
+function OpenWithPicker() {
+  const tab = useSessionStore(
+    (s) => s.tabs.find((t) => t.id === s.activeTabId),
+    (a, b) => a === b || (!!a && !!b && a.claudeSessionId === b.claudeSessionId && a.workingDirectory === b.workingDirectory),
+  )
+  const preferredOpenWith = useThemeStore((s) => s.preferredOpenWith)
+  const setPreferredOpenWith = useThemeStore((s) => s.setPreferredOpenWith)
+  const popoverLayer = usePopoverLayer()
+  const colors = useColors()
+
+  const [open, setOpen] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const popoverRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ bottom: 0, right: 0 })
+
+  const updatePos = useCallback(() => {
+    if (!containerRef.current) return
+    const rect = containerRef.current.getBoundingClientRect()
+    setPos({
+      bottom: window.innerHeight - rect.top + 6,
+      right: window.innerWidth - rect.right,
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      const target = e.target as Node
+      if (containerRef.current?.contains(target)) return
+      if (popoverRef.current?.contains(target)) return
+      setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  const handleExecute = () => {
+    if (!tab) return
+    if (preferredOpenWith === 'cli') {
+      window.clui.openInTerminal(tab.claudeSessionId, tab.workingDirectory)
+    } else {
+      window.clui.openInVSCode(tab.workingDirectory)
+    }
+  }
+
+  const handleToggle = () => {
+    if (!open) updatePos()
+    setOpen((o) => !o)
+  }
+
+  const handleSelect = (id: 'cli' | 'vscode') => {
+    setPreferredOpenWith(id)
+    setOpen(false)
+  }
+
+  const active = OPEN_WITH_OPTIONS.find((o) => o.id === preferredOpenWith) ?? OPEN_WITH_OPTIONS[0]
+  const ActiveIcon = active.icon
+
+  return (
+    <>
+      <div ref={containerRef} className="flex items-center">
+        <button
+          onClick={handleExecute}
+          className="flex items-center gap-1 text-[11px] rounded-l-full pl-2 pr-1 py-0.5 transition-colors"
+          style={{ color: colors.textTertiary, cursor: 'pointer' }}
+          title={active.label}
+        >
+          {active.label}
+          <ActiveIcon size={11} />
+        </button>
+        <button
+          onClick={handleToggle}
+          className="flex items-center rounded-r-full pr-1.5 py-0.5 transition-colors"
+          style={{ color: colors.textTertiary, cursor: 'pointer' }}
+          title="Switch open-with app"
+        >
+          <CaretDown size={9} style={{ opacity: 0.6 }} />
+        </button>
+      </div>
+
+      {popoverLayer && open && createPortal(
+        <motion.div
+          ref={popoverRef}
+          data-clui-ui
+          initial={{ opacity: 0, y: 4 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 4 }}
+          transition={{ duration: 0.12 }}
+          className="rounded-xl"
+          style={{
+            position: 'fixed',
+            bottom: pos.bottom,
+            right: pos.right,
+            width: 180,
+            pointerEvents: 'auto',
+            background: colors.popoverBg,
+            backdropFilter: 'blur(20px)',
+            WebkitBackdropFilter: 'blur(20px)',
+            boxShadow: colors.popoverShadow,
+            border: `1px solid ${colors.popoverBorder}`,
+          }}
+        >
+          <div className="py-1">
+            {OPEN_WITH_OPTIONS.map((opt) => {
+              const Icon = opt.icon
+              const isSelected = preferredOpenWith === opt.id
+              return (
+                <button
+                  key={opt.id}
+                  onClick={() => handleSelect(opt.id)}
+                  className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] transition-colors"
+                  style={{
+                    color: isSelected ? colors.textPrimary : colors.textSecondary,
+                    fontWeight: isSelected ? 600 : 400,
+                  }}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Icon size={12} />
+                    {opt.label}
+                  </span>
+                  {isSelected && <Check size={12} style={{ color: colors.accent }} />}
+                </button>
+              )
+            })}
           </div>
         </motion.div>,
         popoverLayer,
@@ -266,13 +427,18 @@ export function StatusBar() {
       && a.hasChosenDirectory === b.hasChosenDirectory
       && a.workingDirectory === b.workingDirectory
       && a.claudeSessionId === b.claudeSessionId
+      && (a.messages.length > 0) === (b.messages.length > 0)
     ),
   )
   const addDirectory = useSessionStore((s) => s.addDirectory)
   const removeDirectory = useSessionStore((s) => s.removeDirectory)
+  const setBaseDirectory = useSessionStore((s) => s.setBaseDirectory)
+  const gitPanelOpen = useSessionStore((s) => s.gitPanelOpen)
+  const toggleGitPanel = useSessionStore((s) => s.toggleGitPanel)
   const popoverLayer = usePopoverLayer()
   const colors = useColors()
 
+  const [isGitRepo, setIsGitRepo] = useState(false)
   const [dirOpen, setDirOpen] = useState(false)
   const dirRef = useRef<HTMLButtonElement>(null)
   const dirPopRef = useRef<HTMLDivElement>(null)
@@ -291,15 +457,30 @@ export function StatusBar() {
     return () => document.removeEventListener('mousedown', handler)
   }, [dirOpen])
 
+  const closeGitPanel = useSessionStore((s) => s.closeGitPanel)
+
+  // Check if working directory is a git repo; close git panel if not
+  useEffect(() => {
+    if (!tab?.workingDirectory || tab.workingDirectory === '~') {
+      setIsGitRepo(false)
+      closeGitPanel()
+      return
+    }
+    window.clui.gitIsRepo(tab.workingDirectory).then(({ isRepo }) => {
+      setIsGitRepo(isRepo)
+      if (!isRepo) closeGitPanel()
+    }).catch(() => {
+      setIsGitRepo(false)
+      closeGitPanel()
+    })
+  }, [tab?.workingDirectory, closeGitPanel])
+
   if (!tab) return null
 
   const isRunning = tab.status === 'running' || tab.status === 'connecting'
   const isEmpty = tab.messages.length === 0
   const hasExtraDirs = tab.additionalDirs.length > 0
-
-  const handleOpenInTerminal = () => {
-    window.clui.openInTerminal(tab.claudeSessionId, tab.workingDirectory)
-  }
+  const baseLocked = !isEmpty
 
   const handleDirClick = () => {
     if (isRunning) return
@@ -316,7 +497,19 @@ export function StatusBar() {
   const handleAddDir = async () => {
     const dir = await window.clui.selectDirectory()
     if (dir) {
-      addDirectory(dir)
+      if (!tab.hasChosenDirectory && !baseLocked) {
+        setBaseDirectory(dir)
+      } else {
+        addDirectory(dir)
+      }
+    }
+  }
+
+  const handleChangeBaseDir = async () => {
+    if (isRunning || baseLocked) return
+    const dir = await window.clui.selectDirectory()
+    if (dir) {
+      setBaseDirectory(dir)
     }
   }
 
@@ -375,14 +568,20 @@ export function StatusBar() {
           >
             <div className="py-1.5 px-1">
               {/* Base directory */}
-              <div className="px-2 py-1">
+              <button
+                onClick={handleChangeBaseDir}
+                disabled={isRunning || baseLocked}
+                className="w-full text-left px-2 py-1 rounded-lg transition-colors"
+                style={{ cursor: isRunning || baseLocked ? 'default' : 'pointer', opacity: baseLocked ? 0.7 : 1 }}
+                title={baseLocked ? 'Base directory is locked after the conversation starts' : tab.hasChosenDirectory ? `${tab.workingDirectory} — click to change` : 'Click to choose a base directory'}
+              >
                 <div className="text-[9px] uppercase tracking-wider mb-1" style={{ color: colors.textTertiary }}>
                   Base directory
                 </div>
-                <div className="text-[11px] truncate" style={{ color: tab.hasChosenDirectory ? colors.textSecondary : colors.textMuted }} title={tab.hasChosenDirectory ? tab.workingDirectory : 'No folder selected — defaults to home directory'}>
+                <div className="text-[11px] truncate" style={{ color: tab.hasChosenDirectory ? colors.textSecondary : colors.textMuted }}>
                   {tab.hasChosenDirectory ? tab.workingDirectory : 'None (defaults to ~)'}
                 </div>
-              </div>
+              </button>
 
               {/* Additional directories */}
               {hasExtraDirs && (
@@ -436,17 +635,22 @@ export function StatusBar() {
         <PermissionModePicker />
       </div>
 
-      {/* Right — Open in CLI */}
+      {/* Right — Git + Open in CLI */}
       <div className="flex items-center gap-1.5 flex-shrink-0">
-        <button
-          onClick={handleOpenInTerminal}
-          className="flex items-center gap-1 text-[11px] rounded-full px-2 py-0.5 transition-colors"
-          style={{ color: colors.textTertiary }}
-          title="Open this session in Terminal"
-        >
-          Open in CLI
-          <Terminal size={11} />
-        </button>
+        {isGitRepo && (
+          <>
+            <button
+              onClick={toggleGitPanel}
+              className="flex items-center gap-0.5 rounded-full px-1.5 py-0.5 transition-colors"
+              style={{ color: gitPanelOpen ? colors.accent : colors.textTertiary, cursor: 'pointer' }}
+              title={gitPanelOpen ? 'Close git panel' : 'Open git panel'}
+            >
+              <GitBranch size={11} />
+            </button>
+            <span style={{ color: colors.textMuted, fontSize: 10 }}>|</span>
+          </>
+        )}
+        <OpenWithPicker />
       </div>
     </div>
   )

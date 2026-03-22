@@ -1,11 +1,13 @@
-import React, { useEffect, useCallback } from 'react'
+import React, { useEffect, useCallback, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Paperclip, Camera, HeadCircuit } from '@phosphor-icons/react'
+import { GitPanel } from './components/GitPanel'
 import { TabStrip } from './components/TabStrip'
 import { ConversationView } from './components/ConversationView'
-import { InputBar } from './components/InputBar'
+import { InputBar, useBashModeStore } from './components/InputBar'
 import { StatusBar } from './components/StatusBar'
 import { MarketplacePanel } from './components/MarketplacePanel'
+import { SettingsDialog } from './components/SettingsDialog'
 import { PopoverLayerProvider } from './components/PopoverLayer'
 import { useClaudeEvents } from './hooks/useClaudeEvents'
 import { useHealthReconciliation } from './hooks/useHealthReconciliation'
@@ -18,11 +20,13 @@ export default function App() {
   useClaudeEvents()
   useHealthReconciliation()
 
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const activeTabStatus = useSessionStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.status)
   const addAttachments = useSessionStore((s) => s.addAttachments)
   const colors = useColors()
   const setSystemTheme = useThemeStore((s) => s.setSystemTheme)
   const expandedUI = useThemeStore((s) => s.expandedUI)
+  const bashModeActive = useBashModeStore((s) => s.active)
 
   // ─── Theme initialization ───
   useEffect(() => {
@@ -38,21 +42,99 @@ export default function App() {
     return unsub
   }, [setSystemTheme])
 
+  // Listen for show-settings IPC from tray menu
   useEffect(() => {
-    useSessionStore.getState().initStaticInfo().then(() => {
+    const unsub = window.clui.onShowSettings(() => {
+      setSettingsOpen(true)
+    })
+    return unsub
+  }, [])
+
+  useEffect(() => {
+    useSessionStore.getState().initStaticInfo().then(async () => {
       const homeDir = useSessionStore.getState().staticInfo?.homePath || '~'
+
+      // Try restoring saved tabs
+      const saved = await window.clui.loadTabs().catch(() => null)
+      if (saved && saved.tabs && saved.tabs.length > 0) {
+        // Restore each saved tab via resumeSession
+        const restoredTabIds: Array<{ tabId: string; sessionId: string }> = []
+        for (const st of saved.tabs) {
+          const tabId = await useSessionStore.getState().resumeSession(
+            st.claudeSessionId,
+            st.title,
+            st.workingDirectory,
+          )
+          restoredTabIds.push({ tabId, sessionId: st.claudeSessionId })
+
+          // Patch extra per-tab settings that resumeSession doesn't handle
+          useSessionStore.setState((s) => ({
+            tabs: s.tabs.map((t) =>
+              t.id === tabId
+                ? {
+                    ...t,
+                    customTitle: st.customTitle || null,
+                    hasChosenDirectory: st.hasChosenDirectory,
+                    additionalDirs: st.additionalDirs,
+                    permissionMode: st.permissionMode,
+                    bashResults: st.bashResults || [],
+                    pillColor: st.pillColor || null,
+                  }
+                : t
+            ),
+          }))
+        }
+
+        // Set active tab by matching activeSessionId
+        if (saved.activeSessionId) {
+          const activeEntry = restoredTabIds.find((r) => r.sessionId === saved.activeSessionId)
+          if (activeEntry) {
+            useSessionStore.setState({ activeTabId: activeEntry.tabId })
+          }
+        }
+
+        // Remove the initial blank tab created by store constructor
+        const initialTabId = useSessionStore.getState().tabs[0]?.id
+        const isInitialBlank = initialTabId && !restoredTabIds.some((r) => r.tabId === initialTabId)
+        if (isInitialBlank) {
+          useSessionStore.setState((s) => ({
+            tabs: s.tabs.filter((t) => t.id !== initialTabId),
+          }))
+        }
+
+        // Auto-expand if setting enabled, otherwise stay collapsed
+        const expandOnSwitch = useThemeStore.getState().expandOnTabSwitch
+        useSessionStore.setState({ isExpanded: expandOnSwitch, tabsReady: true })
+        return
+      }
+
+      // No saved tabs -- fall through to blank tab behavior
       const tab = useSessionStore.getState().tabs[0]
       if (tab) {
-        // Set working directory to home by default (user hasn't chosen yet)
+        const defaultBase = useThemeStore.getState().defaultBaseDirectory
+        const startDir = defaultBase || homeDir
+        const hasChosen = !!defaultBase
         useSessionStore.setState((s) => ({
-          tabs: s.tabs.map((t, i) => (i === 0 ? { ...t, workingDirectory: homeDir, hasChosenDirectory: false } : t)),
+          tabs: s.tabs.map((t, i) => (i === 0 ? { ...t, workingDirectory: startDir, hasChosenDirectory: hasChosen } : t)),
         }))
-        window.clui.createTab().then(({ tabId }) => {
-          useSessionStore.setState((s) => ({
-            tabs: s.tabs.map((t, i) => (i === 0 ? { ...t, id: tabId } : t)),
-            activeTabId: tabId,
-          }))
-        }).catch(() => {})
+        const registerInitialTab = async (retries = 5): Promise<void> => {
+          for (let i = 0; i < retries; i++) {
+            try {
+              const { tabId } = await window.clui.createTab()
+              useSessionStore.setState((s) => ({
+                tabs: s.tabs.map((t, idx) => (idx === 0 ? { ...t, id: tabId } : t)),
+                activeTabId: tabId,
+                tabsReady: true,
+              }))
+              return
+            } catch {
+              if (i < retries - 1) await new Promise((r) => setTimeout(r, 500))
+            }
+          }
+          // All retries failed — still set tabsReady so UI isn't stuck forever
+          useSessionStore.setState({ tabsReady: true })
+        }
+        registerInitialTab()
       }
     })
   }, [])
@@ -93,6 +175,7 @@ export default function App() {
 
   const isExpanded = useSessionStore((s) => s.isExpanded)
   const marketplaceOpen = useSessionStore((s) => s.marketplaceOpen)
+  const gitPanelOpen = useSessionStore((s) => s.gitPanelOpen)
   const isRunning = activeTabStatus === 'running' || activeTabStatus === 'connecting'
 
   // Layout dimensions — expandedUI widens and heightens the panel
@@ -156,6 +239,43 @@ export default function App() {
             )}
           </AnimatePresence>
 
+          <AnimatePresence initial={false}>
+            {settingsOpen && (
+              <div
+                data-clui-ui
+                style={{
+                  width: 420,
+                  maxWidth: 420,
+                  marginLeft: '50%',
+                  transform: 'translateX(-50%)',
+                  marginBottom: 14,
+                  position: 'relative',
+                  zIndex: 30,
+                }}
+              >
+                <motion.div
+                  initial={{ opacity: 0, y: 14, scale: 0.98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 10, scale: 0.985 }}
+                  transition={TRANSITION}
+                >
+                  <div
+                    data-clui-ui
+                    className="glass-surface overflow-hidden no-drag"
+                    style={{
+                      borderRadius: 24,
+                      maxHeight: 520,
+                      display: 'flex',
+                      flexDirection: 'column' as const,
+                    }}
+                  >
+                    <SettingsDialog onClose={() => setSettingsOpen(false)} />
+                  </div>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
           {/*
             ─── Tabs / message shell ───
             This always remains the chat shell. The marketplace is a separate
@@ -206,7 +326,7 @@ export default function App() {
 
           {/* ─── Input row — circles float outside left ─── */}
           {/* marginBottom: shadow buffer so the glass-surface drop shadow isn't clipped at the native window edge */}
-          <div data-clui-ui className="relative" style={{ minHeight: 46, zIndex: 15, marginBottom: 10 }}>
+          <div data-clui-ui className="relative" style={{ minHeight: 46, zIndex: 15, marginBottom: 60 }}>
             {/* Stacked circle buttons — expand on hover */}
             <div
               data-clui-ui
@@ -247,11 +367,33 @@ export default function App() {
             <div
               data-clui-ui
               className="glass-surface w-full"
-              style={{ minHeight: 50, borderRadius: 25, padding: '0 6px 0 16px', background: colors.inputPillBg }}
+              style={{ minHeight: 50, borderRadius: 25, padding: '0 6px 0 16px', background: colors.inputPillBg, boxShadow: bashModeActive ? 'inset 0 0 0 2px rgba(244, 114, 182, 0.5)' : undefined, transition: 'box-shadow 0.15s' }}
             >
               <InputBar />
             </div>
           </div>
+          {/* Git side panel — anchored to right edge of content column */}
+          <AnimatePresence>
+            {gitPanelOpen && (
+              <motion.div
+                data-clui-ui
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+                transition={TRANSITION}
+                style={{
+                  position: 'absolute',
+                  left: '100%',
+                  bottom: 60,
+                  marginLeft: 8,
+                  width: 280,
+                  zIndex: 25,
+                }}
+              >
+                <GitPanel />
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
       </div>
     </PopoverLayerProvider>

@@ -134,6 +134,13 @@ const darkColors = {
   // Permission denied card
   permissionDeniedBorder: 'rgba(196, 112, 96, 0.3)',
   permissionDeniedHeaderBorder: 'rgba(196, 112, 96, 0.12)',
+
+  // Info / question card (blue)
+  infoBg: 'rgba(96, 165, 250, 0.1)',
+  infoHoverBg: 'rgba(96, 165, 250, 0.15)',
+  infoBorder: 'rgba(96, 165, 250, 0.25)',
+  infoText: 'rgba(96, 165, 250, 0.85)',
+  infoShadow: 'rgba(96, 165, 250, 0.06)',
 } as const
 
 const lightColors = {
@@ -264,6 +271,13 @@ const lightColors = {
   // Permission denied card
   permissionDeniedBorder: 'rgba(196, 112, 96, 0.3)',
   permissionDeniedHeaderBorder: 'rgba(196, 112, 96, 0.12)',
+
+  // Info / question card (blue)
+  infoBg: 'rgba(96, 165, 250, 0.08)',
+  infoHoverBg: 'rgba(96, 165, 250, 0.12)',
+  infoBorder: 'rgba(96, 165, 250, 0.25)',
+  infoText: 'rgba(59, 130, 246, 0.9)',
+  infoShadow: 'rgba(96, 165, 250, 0.06)',
 } as const
 
 export type ColorPalette = { [K in keyof typeof darkColors]: string }
@@ -277,12 +291,34 @@ interface ThemeState {
   themeMode: ThemeMode
   soundEnabled: boolean
   expandedUI: boolean
+  defaultBaseDirectory: string
+  showDirLabel: boolean
+  preferredOpenWith: 'cli' | 'vscode'
+  showImplementClearContext: boolean
+  defaultPermissionMode: 'ask' | 'auto' | 'plan'
+  expandOnTabSwitch: boolean
+  bashCommandEntry: boolean
+  gitPanelSplitRatio: number
+  gitPanelChangesOpen: boolean
+  gitPanelGraphOpen: boolean
+  expandToolResults: boolean
   /** OS-reported dark mode — used when themeMode is 'system' */
   _systemIsDark: boolean
   setIsDark: (isDark: boolean) => void
   setThemeMode: (mode: ThemeMode) => void
   setSoundEnabled: (enabled: boolean) => void
   setExpandedUI: (expanded: boolean) => void
+  setDefaultBaseDirectory: (dir: string) => void
+  setShowDirLabel: (show: boolean) => void
+  setPreferredOpenWith: (app: 'cli' | 'vscode') => void
+  setShowImplementClearContext: (show: boolean) => void
+  setDefaultPermissionMode: (mode: 'ask' | 'auto' | 'plan') => void
+  setExpandOnTabSwitch: (enabled: boolean) => void
+  setBashCommandEntry: (enabled: boolean) => void
+  setGitPanelSplitRatio: (ratio: number) => void
+  setGitPanelChangesOpen: (open: boolean) => void
+  setGitPanelGraphOpen: (open: boolean) => void
+  setExpandToolResults: (enabled: boolean) => void
   /** Called by OS theme change listener — updates system value */
   setSystemTheme: (isDark: boolean) => void
 }
@@ -306,35 +342,36 @@ function applyTheme(isDark: boolean): void {
   syncTokensToCss(isDark ? darkColors : lightColors)
 }
 
-const SETTINGS_KEY = 'clui-settings'
+const SETTINGS_DEFAULTS = { themeMode: 'dark' as ThemeMode, soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', showDirLabel: false, preferredOpenWith: 'cli' as 'cli' | 'vscode', showImplementClearContext: false, defaultPermissionMode: 'plan' as 'ask' | 'auto' | 'plan', expandOnTabSwitch: true, bashCommandEntry: false, gitPanelSplitRatio: 0.4, gitPanelChangesOpen: true, gitPanelGraphOpen: true, expandToolResults: false }
 
-function loadSettings(): { themeMode: ThemeMode; soundEnabled: boolean; expandedUI: boolean } {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      return {
-        themeMode: ['light', 'dark'].includes(parsed.themeMode) ? parsed.themeMode : 'dark',
-        soundEnabled: typeof parsed.soundEnabled === 'boolean' ? parsed.soundEnabled : true,
-        expandedUI: typeof parsed.expandedUI === 'boolean' ? parsed.expandedUI : false,
-      }
-    }
-  } catch {}
-  return { themeMode: 'dark', soundEnabled: true, expandedUI: false }
+function saveSettings(s: { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string; showDirLabel: boolean; preferredOpenWith: string; showImplementClearContext: boolean; defaultPermissionMode: string; expandOnTabSwitch: boolean; bashCommandEntry: boolean; gitPanelSplitRatio: number; gitPanelChangesOpen: boolean; gitPanelGraphOpen: boolean; expandToolResults: boolean }): void {
+  window.clui?.saveSettings(s)
 }
 
-function saveSettings(s: { themeMode: ThemeMode; soundEnabled: boolean; expandedUI: boolean }): void {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)) } catch {}
+function getAllSettings(get: () => ThemeState): { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string; showDirLabel: boolean; preferredOpenWith: string; showImplementClearContext: boolean; defaultPermissionMode: string; expandOnTabSwitch: boolean; bashCommandEntry: boolean; gitPanelSplitRatio: number; gitPanelChangesOpen: boolean; gitPanelGraphOpen: boolean; expandToolResults: boolean } {
+  const s = get()
+  return { themeMode: s.themeMode, soundEnabled: s.soundEnabled, expandedUI: s.expandedUI, defaultBaseDirectory: s.defaultBaseDirectory, showDirLabel: s.showDirLabel, preferredOpenWith: s.preferredOpenWith, showImplementClearContext: s.showImplementClearContext, defaultPermissionMode: s.defaultPermissionMode, expandOnTabSwitch: s.expandOnTabSwitch, bashCommandEntry: s.bashCommandEntry, gitPanelSplitRatio: s.gitPanelSplitRatio, gitPanelChangesOpen: s.gitPanelChangesOpen, gitPanelGraphOpen: s.gitPanelGraphOpen, expandToolResults: s.expandToolResults }
 }
 
-// Always start in compact UI mode on launch.
-const saved = { ...loadSettings(), expandedUI: false }
+// Start with defaults; async load from disk will update immediately after mount.
+const saved = { ...SETTINGS_DEFAULTS, expandedUI: false }
 
 export const useThemeStore = create<ThemeState>((set, get) => ({
   isDark: saved.themeMode === 'dark' ? true : saved.themeMode === 'light' ? false : true,
   themeMode: saved.themeMode,
   soundEnabled: saved.soundEnabled,
   expandedUI: saved.expandedUI,
+  defaultBaseDirectory: saved.defaultBaseDirectory,
+  showDirLabel: saved.showDirLabel,
+  preferredOpenWith: saved.preferredOpenWith,
+  showImplementClearContext: saved.showImplementClearContext,
+  defaultPermissionMode: saved.defaultPermissionMode,
+  expandOnTabSwitch: saved.expandOnTabSwitch,
+  bashCommandEntry: saved.bashCommandEntry,
+  gitPanelSplitRatio: saved.gitPanelSplitRatio,
+  gitPanelChangesOpen: saved.gitPanelChangesOpen,
+  gitPanelGraphOpen: saved.gitPanelGraphOpen,
+  expandToolResults: saved.expandToolResults,
   _systemIsDark: true,
   setIsDark: (isDark) => {
     set({ isDark })
@@ -344,15 +381,59 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
     const resolved = mode === 'system' ? get()._systemIsDark : mode === 'dark'
     set({ themeMode: mode, isDark: resolved })
     applyTheme(resolved)
-    saveSettings({ themeMode: mode, soundEnabled: get().soundEnabled, expandedUI: get().expandedUI })
+    saveSettings(getAllSettings(get))
   },
   setSoundEnabled: (enabled) => {
     set({ soundEnabled: enabled })
-    saveSettings({ themeMode: get().themeMode, soundEnabled: enabled, expandedUI: get().expandedUI })
+    saveSettings(getAllSettings(get))
   },
   setExpandedUI: (expanded) => {
     set({ expandedUI: expanded })
-    saveSettings({ themeMode: get().themeMode, soundEnabled: get().soundEnabled, expandedUI: expanded })
+    saveSettings(getAllSettings(get))
+  },
+  setDefaultBaseDirectory: (dir) => {
+    set({ defaultBaseDirectory: dir })
+    saveSettings(getAllSettings(get))
+  },
+  setShowDirLabel: (show) => {
+    set({ showDirLabel: show })
+    saveSettings(getAllSettings(get))
+  },
+  setPreferredOpenWith: (app) => {
+    set({ preferredOpenWith: app })
+    saveSettings(getAllSettings(get))
+  },
+  setShowImplementClearContext: (show) => {
+    set({ showImplementClearContext: show })
+    saveSettings(getAllSettings(get))
+  },
+  setDefaultPermissionMode: (mode) => {
+    set({ defaultPermissionMode: mode })
+    saveSettings(getAllSettings(get))
+  },
+  setExpandOnTabSwitch: (enabled) => {
+    set({ expandOnTabSwitch: enabled })
+    saveSettings(getAllSettings(get))
+  },
+  setBashCommandEntry: (enabled) => {
+    set({ bashCommandEntry: enabled })
+    saveSettings(getAllSettings(get))
+  },
+  setGitPanelSplitRatio: (ratio) => {
+    set({ gitPanelSplitRatio: ratio })
+    saveSettings(getAllSettings(get))
+  },
+  setGitPanelChangesOpen: (open) => {
+    set({ gitPanelChangesOpen: open })
+    saveSettings(getAllSettings(get))
+  },
+  setGitPanelGraphOpen: (open) => {
+    set({ gitPanelGraphOpen: open })
+    saveSettings(getAllSettings(get))
+  },
+  setExpandToolResults: (enabled) => {
+    set({ expandToolResults: enabled })
+    saveSettings(getAllSettings(get))
   },
   setSystemTheme: (isDark) => {
     set({ _systemIsDark: isDark })
@@ -366,6 +447,28 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
 
 // Initialize CSS vars with saved theme
 syncTokensToCss(saved.themeMode === 'light' ? lightColors : darkColors)
+
+// Load persisted settings from disk (async, fires once on startup)
+window.clui?.loadSettings().then((disk) => {
+  if (!disk) return
+  const store = useThemeStore.getState()
+  const mode = (['light', 'dark'].includes(disk.themeMode) ? disk.themeMode : 'dark') as ThemeMode
+  const resolved = mode === 'system' ? store._systemIsDark : mode === 'dark'
+  const sound = typeof disk.soundEnabled === 'boolean' ? disk.soundEnabled : true
+  const expanded = typeof disk.expandedUI === 'boolean' ? disk.expandedUI : false
+  const baseDir = typeof disk.defaultBaseDirectory === 'string' ? disk.defaultBaseDirectory : ''
+  const dirLabel = typeof disk.showDirLabel === 'boolean' ? disk.showDirLabel : false
+  const openWith = (disk.preferredOpenWith === 'cli' || disk.preferredOpenWith === 'vscode') ? disk.preferredOpenWith : 'cli'
+  const implClearCtx = typeof disk.showImplementClearContext === 'boolean' ? disk.showImplementClearContext : false
+  const expandTabSwitch = typeof disk.expandOnTabSwitch === 'boolean' ? disk.expandOnTabSwitch : true
+  const bashCmd = typeof disk.bashCommandEntry === 'boolean' ? disk.bashCommandEntry : false
+  const splitRatio = typeof disk.gitPanelSplitRatio === 'number' ? disk.gitPanelSplitRatio : 0.4
+  const changesOpen = typeof disk.gitPanelChangesOpen === 'boolean' ? disk.gitPanelChangesOpen : true
+  const graphOpen = typeof disk.gitPanelGraphOpen === 'boolean' ? disk.gitPanelGraphOpen : true
+  const expandTools = typeof disk.expandToolResults === 'boolean' ? disk.expandToolResults : false
+  useThemeStore.setState({ themeMode: mode, isDark: resolved, soundEnabled: sound, expandedUI: expanded, defaultBaseDirectory: baseDir, showDirLabel: dirLabel, preferredOpenWith: openWith, showImplementClearContext: implClearCtx, expandOnTabSwitch: expandTabSwitch, bashCommandEntry: bashCmd, gitPanelSplitRatio: splitRatio, gitPanelChangesOpen: changesOpen, gitPanelGraphOpen: graphOpen, expandToolResults: expandTools })
+  applyTheme(resolved)
+})
 
 /** Reactive hook — returns the active color palette */
 export function useColors(): ColorPalette {

@@ -71,8 +71,9 @@ export class ControlPlane extends EventEmitter {
   private permissionServer: PermissionServer
   /** Per-run tokens: requestId → runToken (for cleanup on exit/error) */
   private runTokens = new Map<string, string>()
-  /** Global permission mode: 'ask' shows cards, 'auto' auto-approves */
-  private permissionMode: 'ask' | 'auto' = 'ask'
+  /** Per-tab permission modes */
+  private permissionModes = new Map<string, 'ask' | 'auto' | 'plan'>()
+
   /** Resolves when the permission server is ready (or failed). Dispatch awaits this. */
   private hookServerReady: Promise<void>
 
@@ -105,10 +106,11 @@ export class ControlPlane extends EventEmitter {
         return
       }
 
-      log(`Permission request [${questionId}]: tool=${toolRequest.tool_name} tab=${tabId.substring(0, 8)}… mode=${this.permissionMode}`)
+      const tabMode = this._getPermissionMode(tabId)
+      log(`Permission request [${questionId}]: tool=${toolRequest.tool_name} tab=${tabId.substring(0, 8)}… mode=${tabMode}`)
 
-      // Auto mode: immediately allow without showing UI
-      if (this.permissionMode === 'auto') {
+      // Auto/Plan mode: immediately allow without showing UI
+      if (tabMode === 'auto' || tabMode === 'plan') {
         this.permissionServer.respondToPermission(questionId, 'allow', 'Auto mode')
         return
       }
@@ -148,6 +150,7 @@ export class ControlPlane extends EventEmitter {
       // Handle session init
       if (event.type === 'session_init') {
         tab.claudeSessionId = event.sessionId
+        log(`Session init [${requestId.substring(0, 8)}]: cliMode=${(event as any).permissionMode || 'unknown'}, session=${event.sessionId.substring(0, 8)}`)
 
         if (this.initRequestIds.has(requestId)) {
           // Warmup init — emit session_init with isWarmup flag, don't change status
@@ -302,6 +305,7 @@ export class ControlPlane extends EventEmitter {
       // Handle session init
       if (event.type === 'session_init') {
         tab.claudeSessionId = event.sessionId
+        log(`Session init (pty) [${requestId.substring(0, 8)}]: cliMode=${(event as any).permissionMode || 'unknown'}, session=${event.sessionId.substring(0, 8)}`)
 
         if (this.initRequestIds.has(requestId)) {
           this.emit('event', tabId, { ...event, isWarmup: true })
@@ -431,6 +435,18 @@ export class ControlPlane extends EventEmitter {
 
   createTab(): string {
     const tabId = crypto.randomUUID()
+    this.ensureTab(tabId)
+    return tabId
+  }
+
+  /** Check if a tab exists in the registry */
+  hasTab(tabId: string): boolean {
+    return this.tabs.has(tabId)
+  }
+
+  /** Register a tab if it doesn't already exist (idempotent) */
+  ensureTab(tabId: string): void {
+    if (this.tabs.has(tabId)) return
     const entry: TabRegistryEntry = {
       tabId,
       claudeSessionId: null,
@@ -442,8 +458,7 @@ export class ControlPlane extends EventEmitter {
       promptCount: 0,
     }
     this.tabs.set(tabId, entry)
-    log(`Tab created: ${tabId}`)
-    return tabId
+    log(`Tab registered: ${tabId}`)
   }
 
   /**
@@ -479,12 +494,15 @@ export class ControlPlane extends EventEmitter {
   }
 
   /**
-   * Set global permission mode.
-   * 'ask' = show permission cards, 'auto' = auto-approve all tool calls.
+   * Set permission mode for a specific tab.
    */
-  setPermissionMode(mode: 'ask' | 'auto'): void {
-    log(`Permission mode set to: ${mode}`)
-    this.permissionMode = mode
+  setPermissionMode(tabId: string, mode: 'ask' | 'auto' | 'plan'): void {
+    log(`Permission mode for tab ${tabId}: ${mode}`)
+    this.permissionModes.set(tabId, mode)
+  }
+
+  private _getPermissionMode(tabId: string): 'ask' | 'auto' | 'plan' {
+    return this.permissionModes.get(tabId) ?? 'plan'
   }
 
   closeTab(tabId: string): void {
@@ -515,6 +533,7 @@ export class ControlPlane extends EventEmitter {
       return true
     })
 
+    this.permissionModes.delete(tabId)
     this.tabs.delete(tabId)
     log(`Tab closed: ${tabId}`)
   }
@@ -603,6 +622,13 @@ export class ControlPlane extends EventEmitter {
       this.runTokens.set(requestId, runToken)
       const hookSettingsPath = this.permissionServer.generateSettingsFile(runToken)
       options = { ...options, hookSettingsPath }
+    }
+
+    // Inject CLI permission mode for plan mode
+    const tabMode = this._getPermissionMode(tabId)
+    log(`Dispatch [${requestId.substring(0, 8)}]: mode=${tabMode}, resume=${!!tab.claudeSessionId}, session=${tab.claudeSessionId?.substring(0, 8) || 'new'}`)
+    if (tabMode === 'plan') {
+      options = { ...options, permissionModeCli: 'plan' }
     }
 
     tab.activeRequestId = requestId
@@ -810,6 +836,13 @@ export class ControlPlane extends EventEmitter {
     tab.status = newStatus
     log(`Tab ${tabId}: ${oldStatus} → ${newStatus}`)
     this.emit('tab-status-change', tabId, newStatus, oldStatus)
+  }
+
+  hasRunningTabs(): boolean {
+    for (const tab of this.tabs.values()) {
+      if (tab.status === 'running' || tab.status === 'connecting') return true
+    }
+    return false
   }
 
   // ─── Shutdown ───

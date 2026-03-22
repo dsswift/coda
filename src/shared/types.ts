@@ -154,6 +154,8 @@ export interface TabState {
   attachments: Attachment[]
   messages: Message[]
   title: string
+  /** User-provided custom tab name (overrides auto-generated title when set) */
+  customTitle: string | null
   /** Last run's result data (cost, tokens, duration) */
   lastResult: RunResult | null
   /** Session metadata from init event */
@@ -170,6 +172,12 @@ export interface TabState {
   hasChosenDirectory: boolean
   /** Extra directories accessible via --add-dir (session-preserving) */
   additionalDirs: string[]
+  /** Per-tab permission mode: 'ask' shows cards, 'auto' auto-approves, 'plan' uses CLI plan mode */
+  permissionMode: 'ask' | 'auto' | 'plan'
+  /** Pending bash command results to send as context with next prompt */
+  bashResults: Array<{ command: string; stdout: string; stderr: string }>
+  /** Custom pill outline color (null = use theme default) */
+  pillColor: string | null
 }
 
 export interface Message {
@@ -178,7 +186,12 @@ export interface Message {
   content: string
   toolName?: string
   toolInput?: string
+  toolId?: string
   toolStatus?: 'running' | 'completed' | 'error'
+  /** True for messages originating from user bash command entry (! prefix) */
+  userExecuted?: boolean
+  /** True when the expand-tool-results setting auto-expanded this result */
+  autoExpandResult?: boolean
   timestamp: number
 }
 
@@ -198,6 +211,7 @@ export type NormalizedEvent =
   | { type: 'tool_call'; toolName: string; toolId: string; index: number }
   | { type: 'tool_call_update'; toolId: string; partialInput: string }
   | { type: 'tool_call_complete'; index: number }
+  | { type: 'tool_result'; toolId: string; content: string; isError: boolean }
   | { type: 'task_update'; message: AssistantMessagePayload }
   | { type: 'task_complete'; result: string; costUsd: number; durationMs: number; numTurns: number; usage: UsageData; sessionId: string; permissionDenials?: Array<{ toolName: string; toolUseId: string }> }
   | { type: 'error'; message: string; isError: boolean; sessionId?: string }
@@ -221,6 +235,8 @@ export interface RunOptions {
   hookSettingsPath?: string
   /** Extra directories to add via --add-dir (session-preserving) */
   addDirs?: string[]
+  /** CLI permission mode override (e.g. 'plan') passed as --permission-mode */
+  permissionModeCli?: string
 }
 
 // ─── Control Plane Types ───
@@ -272,6 +288,9 @@ export interface SessionLoadMessage {
   role: string
   content: string
   toolName?: string
+  toolId?: string
+  toolInput?: string
+  userExecuted?: boolean
   timestamp: number
 }
 
@@ -310,6 +329,7 @@ export const IPC = {
   SELECT_DIRECTORY: 'clui:select-directory',
   OPEN_EXTERNAL: 'clui:open-external',
   OPEN_IN_TERMINAL: 'clui:open-in-terminal',
+  OPEN_IN_VSCODE: 'clui:open-in-vscode',
   ATTACH_FILES: 'clui:attach-files',
   TAKE_SCREENSHOT: 'clui:take-screenshot',
   TRANSCRIBE_AUDIO: 'clui:transcribe-audio',
@@ -321,6 +341,7 @@ export const IPC = {
   ANIMATE_HEIGHT: 'clui:animate-height',
   LIST_SESSIONS: 'clui:list-sessions',
   LOAD_SESSION: 'clui:load-session',
+  READ_PLAN: 'clui:read-plan',
 
   // One-way events (main → renderer)
   TEXT_CHUNK: 'clui:text-chunk',
@@ -358,8 +379,101 @@ export const IPC = {
   // Permission mode
   SET_PERMISSION_MODE: 'clui:set-permission-mode',
 
+  // Settings persistence
+  LOAD_SETTINGS: 'clui:load-settings',
+  SAVE_SETTINGS: 'clui:save-settings',
+  SHOW_SETTINGS: 'clui:show-settings',
+
+  // Tab persistence
+  LOAD_TABS: 'clui:load-tabs',
+  SAVE_TABS: 'clui:save-tabs',
+
+  // Git operations
+  GIT_GRAPH: 'clui:git-graph',
+  GIT_CHANGES: 'clui:git-changes',
+  GIT_IS_REPO: 'clui:git-is-repo',
+  GIT_COMMIT: 'clui:git-commit',
+  GIT_FETCH: 'clui:git-fetch',
+  GIT_PULL: 'clui:git-pull',
+  GIT_PUSH: 'clui:git-push',
+  GIT_BRANCHES: 'clui:git-branches',
+  GIT_CHECKOUT: 'clui:git-checkout',
+  GIT_CREATE_BRANCH: 'clui:git-create-branch',
+  GIT_DIFF: 'clui:git-diff',
+  GIT_STAGE: 'clui:git-stage',
+  GIT_UNSTAGE: 'clui:git-unstage',
+  GIT_DISCARD: 'clui:git-discard',
+  GIT_DELETE_BRANCH: 'clui:git-delete-branch',
+
+  // Bash command execution
+  EXECUTE_BASH: 'clui:execute-bash',
+  CANCEL_BASH: 'clui:cancel-bash',
+
   // Legacy (kept for backward compat during migration)
   STREAM_EVENT: 'clui:stream-event',
   RUN_COMPLETE: 'clui:run-complete',
   RUN_ERROR: 'clui:run-error',
 } as const
+
+// ─── Persisted Tab State ───
+
+export interface PersistedTab {
+  claudeSessionId: string
+  title: string
+  customTitle: string | null
+  workingDirectory: string
+  hasChosenDirectory: boolean
+  additionalDirs: string[]
+  permissionMode: 'ask' | 'auto' | 'plan'
+  bashResults?: Array<{ command: string; stdout: string; stderr: string }>
+  pillColor?: string | null
+}
+
+export interface PersistedTabState {
+  activeSessionId: string | null
+  tabs: PersistedTab[]
+}
+
+// ─── Git Types ───
+
+export interface GitCommit {
+  hash: string
+  fullHash: string
+  parents: string[]
+  authorName: string
+  authorDate: string
+  subject: string
+  refs: GitRef[]
+}
+
+export interface GitRef {
+  name: string
+  type: 'head' | 'remote' | 'tag'
+  isCurrent: boolean
+}
+
+export interface GitGraphData {
+  commits: GitCommit[]
+  isGitRepo: boolean
+  totalCount: number
+}
+
+export interface GitChangedFile {
+  path: string
+  status: 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked'
+  staged: boolean
+  oldPath?: string
+}
+
+export interface GitChangesData {
+  files: GitChangedFile[]
+  branch: string
+  isGitRepo: boolean
+}
+
+export interface GitBranchInfo {
+  name: string
+  isCurrent: boolean
+  upstream: string | null
+  isRemote: boolean
+}
