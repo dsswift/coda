@@ -9,11 +9,13 @@ import { promisify } from 'util'
 import { ControlPlane } from './claude/control-plane'
 import { ensureSkills, type SkillStatus } from './skills/installer'
 import { fetchCatalog, listInstalled, installPlugin, uninstallPlugin } from './marketplace/catalog'
+import { discoverCommands } from './claude/command-discovery'
 import { log as _log, LOG_FILE, flushLogs } from './logger'
 import { getCliEnv } from './cli-env'
 import { IPC } from '../shared/types'
 import type { RunOptions, NormalizedEvent, EnrichedError } from '../shared/types'
 import { TerminalManager } from './terminal-manager'
+import { isValidProjectPath, isValidSessionId, validateExternalUrl, buildTerminalCommand } from './ipc-validation'
 
 const gitExec = promisify(execFileCb)
 
@@ -513,10 +515,28 @@ ipcMain.handle(IPC.RESPOND_PERMISSION, (_event, { tabId, questionId, optionId }:
   return controlPlane.respondToPermission(tabId, questionId, optionId)
 })
 
+ipcMain.handle(IPC.DISCOVER_COMMANDS, async (_e, projectPath: string) => {
+  log(`IPC DISCOVER_COMMANDS (path=${projectPath})`)
+  try {
+    if (!isValidProjectPath(projectPath)) {
+      log(`DISCOVER_COMMANDS: rejected invalid projectPath: ${projectPath}`)
+      return []
+    }
+    return await discoverCommands(projectPath)
+  } catch (err) {
+    log(`DISCOVER_COMMANDS error: ${err}`)
+    return []
+  }
+})
+
 ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
   log(`IPC LIST_SESSIONS ${projectPath ? `(path=${projectPath})` : ''}`)
   try {
     const cwd = projectPath || process.cwd()
+    if (!isValidProjectPath(cwd)) {
+      log(`LIST_SESSIONS: rejected invalid projectPath: ${cwd}`)
+      return []
+    }
     // Claude stores project sessions at ~/.claude/projects/<encoded-path>/
     // Path encoding: replace all '/' with '-' (leading '/' becomes leading '-')
     const encodedPath = cwd.replace(/\//g, '-')
@@ -652,7 +672,15 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
   const projectPath = typeof arg === 'string' ? undefined : arg.projectPath
   log(`IPC LOAD_SESSION ${sessionId}${projectPath ? ` (path=${projectPath})` : ''}`)
   try {
+    if (!isValidSessionId(sessionId)) {
+      log(`LOAD_SESSION: rejected invalid sessionId: ${sessionId}`)
+      return []
+    }
     const cwd = projectPath || process.cwd()
+    if (!isValidProjectPath(cwd)) {
+      log(`LOAD_SESSION: rejected invalid projectPath: ${cwd}`)
+      return []
+    }
     const encodedPath = cwd.replace(/\//g, '-')
     const filePath = join(homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)
     if (!existsSync(filePath)) return []
@@ -795,10 +823,10 @@ ipcMain.handle(IPC.SELECT_DIRECTORY, async () => {
 })
 
 ipcMain.handle(IPC.OPEN_EXTERNAL, async (_event, url: string) => {
+  const validUrl = validateExternalUrl(url)
+  if (!validUrl) return false
   try {
-    // Only allow http(s) links from markdown content.
-    if (!/^https?:\/\//i.test(url)) return false
-    await shell.openExternal(url)
+    await shell.openExternal(validUrl)
     return true
   } catch {
     return false
@@ -944,12 +972,24 @@ ipcMain.handle(IPC.PASTE_IMAGE, async (_event, dataUrl: string) => {
 
 ipcMain.handle(IPC.TRANSCRIBE_AUDIO, async (_event, audioBase64: string) => {
   const { writeFileSync, existsSync, unlinkSync, readFileSync } = require('fs')
-  const { execSync } = require('child_process')
-  const { join } = require('path')
+  const { execFile } = require('child_process')
+  const { join, basename } = require('path')
   const { tmpdir } = require('os')
 
   const tmpWav = join(tmpdir(), `clui-voice-${Date.now()}.wav`)
   try {
+    const runExecFile = (bin: string, args: string[], timeout: number): Promise<string> =>
+      new Promise((resolve, reject) => {
+        execFile(bin, args, { encoding: 'utf-8', timeout }, (err: any, stdout: string, stderr: string) => {
+          if (err) {
+            const detail = stderr?.trim() || stdout?.trim() || err.message
+            reject(new Error(detail))
+            return
+          }
+          resolve(stdout || '')
+        })
+      })
+
     const buf = Buffer.from(audioBase64, 'base64')
     writeFileSync(tmpWav, buf)
 
@@ -972,7 +1012,7 @@ ipcMain.handle(IPC.TRANSCRIBE_AUDIO, async (_event, audioBase64: string) => {
     if (!whisperBin) {
       for (const name of ['whisperkit-cli', 'whisper-cli', 'whisper']) {
         try {
-          whisperBin = execSync(`/bin/zsh -lc "whence -p ${name}"`, { encoding: 'utf-8' }).trim()
+          whisperBin = await runExecFile('/bin/zsh', ['-lc', `whence -p ${name}`], 5000).then((s) => s.trim())
           if (whisperBin) break
         } catch {}
       }
@@ -998,12 +1038,9 @@ ipcMain.handle(IPC.TRANSCRIBE_AUDIO, async (_event, audioBase64: string) => {
       // WhisperKit (Apple Silicon CoreML) — auto-downloads models on first run
       // Use --report to produce a JSON file with a top-level "text" field for deterministic parsing
       const reportDir = tmpdir()
-      execSync(
-        `"${whisperBin}" transcribe --audio-path "${tmpWav}" --model tiny --without-timestamps --skip-special-tokens --report --report-path "${reportDir}"`,
-        { encoding: 'utf-8', timeout: 60000 }
-      )
+      output = await runExecFile(whisperBin, ['transcribe', '--audio-path', tmpWav, '--model', 'tiny', '--without-timestamps', '--skip-special-tokens', '--report', '--report-path', reportDir], 60000)
       // WhisperKit writes <audioFileName>.json (filename without extension)
-      const wavBasename = require('path').basename(tmpWav, '.wav')
+      const wavBasename = basename(tmpWav, '.wav')
       const reportPath = join(reportDir, `${wavBasename}.json`)
       if (existsSync(reportPath)) {
         try {
@@ -1019,11 +1056,10 @@ ipcMain.handle(IPC.TRANSCRIBE_AUDIO, async (_event, audioBase64: string) => {
           try { unlinkSync(reportPath) } catch {}
         }
       }
-      // Fallback: re-run without --report, stdout is plain text when --verbose is not set
-      output = execSync(
-        `"${whisperBin}" transcribe --audio-path "${tmpWav}" --model tiny --without-timestamps --skip-special-tokens`,
-        { encoding: 'utf-8', timeout: 60000 }
-      )
+      // Fallback: re-run without --report only if first run produced no stdout
+      if (!output || !output.trim()) {
+        output = await runExecFile(whisperBin, ['transcribe', '--audio-path', tmpWav, '--model', 'tiny', '--without-timestamps', '--skip-special-tokens'], 60000)
+      }
     } else if (isWhisperCpp) {
       // whisper-cpp: whisper-cli -m model -f file --no-timestamps
       // Find model file — prefer multilingual (auto-detect language) over .en (English-only)
@@ -1051,17 +1087,10 @@ ipcMain.handle(IPC.TRANSCRIBE_AUDIO, async (_event, audioBase64: string) => {
       }
 
       const isEnglishOnly = modelPath.includes('.en.')
-      const langFlag = isEnglishOnly ? '-l en' : '-l auto'
-      output = execSync(
-        `"${whisperBin}" -m "${modelPath}" -f "${tmpWav}" --no-timestamps ${langFlag}`,
-        { encoding: 'utf-8', timeout: 30000 }
-      )
+      output = await runExecFile(whisperBin, ['-m', modelPath, '-f', tmpWav, '--no-timestamps', '-l', isEnglishOnly ? 'en' : 'auto'], 30000)
     } else {
       // Python whisper
-      output = execSync(
-        `"${whisperBin}" "${tmpWav}" --model tiny --output_format txt --output_dir "${tmpdir()}"`,
-        { encoding: 'utf-8', timeout: 30000 }
-      )
+      output = await runExecFile(whisperBin, [tmpWav, '--model', 'tiny', '--output_format', 'txt', '--output_dir', tmpdir()], 30000)
       // Python whisper writes .txt file
       const txtPath = tmpWav.replace('.wav', '.txt')
       if (existsSync(txtPath)) {
@@ -1139,14 +1168,19 @@ ipcMain.handle(IPC.OPEN_IN_TERMINAL, (_event, arg: string | null | { sessionId?:
     projectPath = arg.projectPath && arg.projectPath !== '~' ? arg.projectPath : process.cwd()
   }
 
-  // Escape for AppleScript: double quotes → backslash-escaped, backslashes doubled
-  const projectDir = projectPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-  let cmd: string
-  if (sessionId) {
-    cmd = `cd \\"${projectDir}\\" && ${claudeBin} --resume ${sessionId}`
-  } else {
-    cmd = `cd \\"${projectDir}\\" && ${claudeBin}`
+  // Validate sessionId
+  if (sessionId && !isValidSessionId(sessionId)) {
+    log(`OPEN_IN_TERMINAL: rejected invalid sessionId: ${sessionId}`)
+    return false
   }
+
+  // Sanitize projectPath
+  if (!isValidProjectPath(projectPath)) {
+    log(`OPEN_IN_TERMINAL: rejected invalid projectPath: ${projectPath}`)
+    return false
+  }
+
+  const cmd = buildTerminalCommand(projectPath, claudeBin, sessionId)
 
   const script = `tell application "Terminal"
   activate
