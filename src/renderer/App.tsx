@@ -4,7 +4,7 @@ import { Paperclip, Camera, HeadCircuit } from '@phosphor-icons/react'
 import { GitPanel } from './components/GitPanel'
 import { TabStrip } from './components/TabStrip'
 import { ConversationView } from './components/ConversationView'
-import { InputBar } from './components/InputBar'
+import { InputBar, useBashModeStore } from './components/InputBar'
 import { StatusBar } from './components/StatusBar'
 import { MarketplacePanel } from './components/MarketplacePanel'
 import { SettingsDialog } from './components/SettingsDialog'
@@ -26,6 +26,7 @@ export default function App() {
   const colors = useColors()
   const setSystemTheme = useThemeStore((s) => s.setSystemTheme)
   const expandedUI = useThemeStore((s) => s.expandedUI)
+  const bashModeActive = useBashModeStore((s) => s.active)
 
   // ─── Theme initialization ───
   useEffect(() => {
@@ -76,6 +77,7 @@ export default function App() {
                     hasChosenDirectory: st.hasChosenDirectory,
                     additionalDirs: st.additionalDirs,
                     permissionMode: st.permissionMode,
+                    bashResults: st.bashResults || [],
                   }
                 : t
             ),
@@ -99,8 +101,9 @@ export default function App() {
           }))
         }
 
-        // Launch collapsed (resumeSession sets isExpanded=true by default)
-        useSessionStore.setState({ isExpanded: false, tabsReady: true })
+        // Auto-expand if setting enabled, otherwise stay collapsed
+        const expandOnSwitch = useThemeStore.getState().expandOnTabSwitch
+        useSessionStore.setState({ isExpanded: expandOnSwitch, tabsReady: true })
         return
       }
 
@@ -113,15 +116,24 @@ export default function App() {
         useSessionStore.setState((s) => ({
           tabs: s.tabs.map((t, i) => (i === 0 ? { ...t, workingDirectory: startDir, hasChosenDirectory: hasChosen } : t)),
         }))
-        window.clui.createTab().then(({ tabId }) => {
-          useSessionStore.setState((s) => ({
-            tabs: s.tabs.map((t, i) => (i === 0 ? { ...t, id: tabId } : t)),
-            activeTabId: tabId,
-            tabsReady: true,
-          }))
-        }).catch(() => {
+        const registerInitialTab = async (retries = 5): Promise<void> => {
+          for (let i = 0; i < retries; i++) {
+            try {
+              const { tabId } = await window.clui.createTab()
+              useSessionStore.setState((s) => ({
+                tabs: s.tabs.map((t, idx) => (idx === 0 ? { ...t, id: tabId } : t)),
+                activeTabId: tabId,
+                tabsReady: true,
+              }))
+              return
+            } catch {
+              if (i < retries - 1) await new Promise((r) => setTimeout(r, 500))
+            }
+          }
+          // All retries failed — still set tabsReady so UI isn't stuck forever
           useSessionStore.setState({ tabsReady: true })
-        })
+        }
+        registerInitialTab()
       }
     })
   }, [])
@@ -251,7 +263,9 @@ export default function App() {
                     className="glass-surface overflow-hidden no-drag"
                     style={{
                       borderRadius: 24,
-                      maxHeight: 400,
+                      maxHeight: 520,
+                      display: 'flex',
+                      flexDirection: 'column' as const,
                     }}
                   >
                     <SettingsDialog onClose={() => setSettingsOpen(false)} />
@@ -352,7 +366,7 @@ export default function App() {
             <div
               data-clui-ui
               className="glass-surface w-full"
-              style={{ minHeight: 50, borderRadius: 25, padding: '0 6px 0 16px', background: colors.inputPillBg }}
+              style={{ minHeight: 50, borderRadius: 25, padding: '0 6px 0 16px', background: colors.inputPillBg, boxShadow: bashModeActive ? 'inset 0 0 0 2px rgba(244, 114, 182, 0.5)' : undefined, transition: 'box-shadow 0.15s' }}
             >
               <InputBar />
             </div>
