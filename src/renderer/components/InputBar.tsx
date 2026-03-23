@@ -34,8 +34,6 @@ export function InputBar() {
   const [slashIndex, setSlashIndex] = useState(0)
   const bashMode = useBashModeStore((s) => s.active)
   const setBashMode = useBashModeStore((s) => s.set)
-  const [bashExecuting, setBashExecuting] = useState(false)
-  const bashExecIdRef = useRef<string | null>(null)
   const [isMultiLine, setIsMultiLine] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const wrapperRef = useRef<HTMLDivElement>(null)
@@ -56,6 +54,7 @@ export function InputBar() {
   const preferredModel = useSessionStore((s) => s.preferredModel)
   const activeTabId = useSessionStore((s) => s.activeTabId)
   const tab = useSessionStore((s) => s.tabs.find((t) => t.id === s.activeTabId))
+  const bashExecuting = tab?.bashExecuting ?? false
   const tabsReady = useSessionStore((s) => s.tabsReady)
   const bashCommandEntry = useThemeStore((s) => s.bashCommandEntry)
   const colors = useColors()
@@ -71,7 +70,7 @@ export function InputBar() {
   // Discover commands from filesystem on mount and when working directory changes
   useEffect(() => {
     let cancelled = false
-    window.clui.discoverCommands(workingDir).then((cmds) => {
+    window.coda.discoverCommands(workingDir).then((cmds) => {
       if (!cancelled) setDiscoveredCommands(cmds)
     }).catch(() => {})
     return () => { cancelled = true }
@@ -92,7 +91,7 @@ export function InputBar() {
   // Focus textarea when window is shown (shortcut toggle, screenshot return)
   // Skip if focus is inside the terminal panel (xterm manages its own focus)
   useEffect(() => {
-    const unsub = window.clui.onWindowShown(() => {
+    const unsub = window.coda.onWindowShown(() => {
       const active = document.activeElement
       if (active && active.closest('.xterm')) return
       textareaRef.current?.focus()
@@ -293,19 +292,17 @@ export function InputBar() {
       if (isConnecting) return
       const cwd = tab?.workingDirectory || '~'
       const execId = crypto.randomUUID()
-      bashExecIdRef.current = execId
       setInput('')
-      setBashExecuting(true)
+      setBashMode(false)
       if (textareaRef.current) {
         textareaRef.current.style.height = `${INPUT_MIN_HEIGHT}px`
       }
-      const toolMsgId = startBashCommand(cmd)
-      window.clui.executeBash(execId, cmd, cwd).then((result) => {
-        bashExecIdRef.current = null
-        setBashExecuting(false)
-        setBashMode(false)
-        completeBashCommand(toolMsgId, cmd, result.stdout, result.stderr, result.exitCode)
+      const { toolMsgId, tabId } = startBashCommand(cmd, execId)
+      window.coda.executeBash(execId, cmd, cwd).then((result) => {
+        completeBashCommand(tabId, toolMsgId, cmd, result.stdout, result.stderr, result.exitCode)
         requestAnimationFrame(() => textareaRef.current?.focus())
+      }).catch(() => {
+        completeBashCommand(tabId, toolMsgId, cmd, '', 'IPC error: bash execution failed', 1)
       })
       return
     }
@@ -338,16 +335,10 @@ export function InputBar() {
     sendMessage(prompt || 'See attached files')
     // Refocus after React re-renders from the state update
     requestAnimationFrame(() => textareaRef.current?.focus())
-  }, [input, isBusy, sendMessage, attachments.length, showSlashMenu, slashFilter, slashIndex, handleSlashSelect, bashMode, bashExecuting, tab?.workingDirectory, startBashCommand, completeBashCommand, extraCommands])
+  }, [input, isBusy, sendMessage, attachments.length, showSlashMenu, slashFilter, slashIndex, handleSlashSelect, bashMode, bashExecuting, tab?.workingDirectory, startBashCommand, completeBashCommand, extraCommands, isConnecting])
 
   // ─── Keyboard ───
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Cancel running bash command
-    if (bashExecuting && e.key === 'Escape') {
-      e.preventDefault()
-      if (bashExecIdRef.current) window.clui.cancelBash(bashExecIdRef.current)
-      return
-    }
     // Exit bash mode on backspace when input is empty
     if (bashMode && e.key === 'Backspace' && input === '') {
       e.preventDefault()
@@ -388,7 +379,7 @@ export function InputBar() {
         const reader = new FileReader()
         reader.onload = async () => {
           const dataUrl = reader.result as string
-          const attachment = await window.clui.pasteImage(dataUrl)
+          const attachment = await window.coda.pasteImage(dataUrl)
           if (attachment) addAttachments([attachment])
         }
         reader.readAsDataURL(blob)
@@ -431,7 +422,7 @@ export function InputBar() {
       try {
         const blob = new Blob(chunksRef.current, { type: mimeType })
         const wavBase64 = await blobToWavBase64(blob)
-        const result = await window.clui.transcribeAudio(wavBase64)
+        const result = await window.coda.transcribeAudio(wavBase64)
         if (result.error) setVoiceError(result.error)
         else if (result.transcript) setInput((prev) => (prev ? `${prev} ${result.transcript}` : result.transcript!))
       } catch (err: any) { setVoiceError(`Voice failed: ${err.message}`) }
@@ -453,7 +444,7 @@ export function InputBar() {
   const bashPlaceholder = 'Enter bash command...'
 
   return (
-    <div ref={wrapperRef} data-clui-ui className="flex flex-col w-full relative">
+    <div ref={wrapperRef} data-coda-ui className="flex flex-col w-full relative">
       {/* Slash command menu */}
       <AnimatePresence>
         {showSlashMenu && (
@@ -485,8 +476,8 @@ export function InputBar() {
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               placeholder={
-                bashExecuting
-                  ? 'Running... (Esc to cancel)'
+                tab?.bashExecuting
+                  ? 'Running...'
                   : bashMode
                     ? bashPlaceholder
                     : isConnecting
@@ -547,8 +538,8 @@ export function InputBar() {
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               placeholder={
-                bashExecuting
-                  ? 'Running... (Esc to cancel)'
+                tab?.bashExecuting
+                  ? 'Running...'
                   : bashMode
                     ? bashPlaceholder
                     : isConnecting

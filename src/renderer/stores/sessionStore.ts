@@ -81,6 +81,8 @@ interface State {
   fileEditorFocused: boolean
   /** Per-directory editor state (open files, active file). Key = working directory path */
   fileEditorStates: Map<string, FileEditorDirState>
+  /** Global file editor window position and size (persisted across restarts) */
+  editorGeometry: { x: number; y: number; w: number; h: number }
   /** Whether tab restoration has completed (prevents placeholder flash) */
   tabsReady: boolean
 
@@ -133,6 +135,7 @@ interface State {
   reorderEditorFiles: (dir: string, reordered: FileEditorTab[]) => void
   toggleEditorPreview: (dir: string, fileId: string) => void
   toggleEditorReadOnly: (dir: string, fileId: string) => void
+  setEditorGeometry: (geo: { x: number; y: number; w: number; h: number }) => void
   loadMarketplace: (forceRefresh?: boolean) => Promise<void>
   setMarketplaceSearch: (query: string) => void
   setMarketplaceFilter: (filter: string) => void
@@ -141,8 +144,8 @@ interface State {
   buildYourOwn: () => void
   resumeSession: (sessionId: string, title?: string, projectPath?: string) => Promise<string>
   addSystemMessage: (content: string) => void
-  startBashCommand: (command: string) => string
-  completeBashCommand: (toolMsgId: string, command: string, stdout: string, stderr: string, exitCode: number | null) => void
+  startBashCommand: (command: string, execId: string) => { toolMsgId: string; tabId: string }
+  completeBashCommand: (tabId: string, toolMsgId: string, command: string, stdout: string, stderr: string, exitCode: number | null) => void
   sendMessage: (prompt: string, projectPath?: string) => void
   respondPermission: (tabId: string, questionId: string, optionId: string) => void
   addDirectory: (dir: string) => void
@@ -166,7 +169,7 @@ notificationAudio.volume = 1.0
 async function playNotificationIfHidden(): Promise<void> {
   if (!useThemeStore.getState().soundEnabled) return
   try {
-    const visible = await window.clui.isVisible()
+    const visible = await window.coda.isVisible()
     if (!visible) {
       notificationAudio.currentTime = 0
       notificationAudio.play().catch(() => {})
@@ -200,6 +203,8 @@ function makeLocalTab(): TabState {
     additionalDirs: [],
     permissionMode: useThemeStore.getState().defaultPermissionMode,
     bashResults: [],
+    bashExecuting: false,
+    bashExecId: null,
     pillColor: null,
   }
 }
@@ -219,6 +224,7 @@ export const useSessionStore = create<State>((set, get) => ({
   fileEditorOpenTabIds: new Set<string>(),
   fileEditorFocused: true,
   fileEditorStates: new Map(),
+  editorGeometry: { x: 60, y: 80, w: 680, h: 480 },
   tabsReady: false,
 
   // Settings dialog
@@ -236,7 +242,7 @@ export const useSessionStore = create<State>((set, get) => ({
 
   initStaticInfo: async () => {
     try {
-      const result = await window.clui.start()
+      const result = await window.coda.start()
       set({
         staticInfo: {
           version: result.version || 'unknown',
@@ -260,7 +266,7 @@ export const useSessionStore = create<State>((set, get) => ({
         t.id === activeTabId ? { ...t, permissionMode: mode } : t
       ),
     }))
-    window.clui.setPermissionMode(activeTabId, mode)
+    window.coda.setPermissionMode(activeTabId, mode)
   },
 
   createTab: async () => {
@@ -269,7 +275,7 @@ export const useSessionStore = create<State>((set, get) => ({
     const startDir = defaultBase || homeDir
     const hasChosen = !!defaultBase
     try {
-      const { tabId } = await window.clui.createTab()
+      const { tabId } = await window.coda.createTab()
       const tab: TabState = {
         ...makeLocalTab(),
         id: tabId,
@@ -296,7 +302,7 @@ export const useSessionStore = create<State>((set, get) => ({
   createTabInDirectory: async (dir) => {
     useThemeStore.getState().addRecentBaseDirectory(dir)
     try {
-      const { tabId } = await window.clui.createTab()
+      const { tabId } = await window.coda.createTab()
       const tab: TabState = {
         ...makeLocalTab(),
         id: tabId,
@@ -652,12 +658,14 @@ export const useSessionStore = create<State>((set, get) => ({
     })
   },
 
+  setEditorGeometry: (geo) => set({ editorGeometry: geo }),
+
   loadMarketplace: async (forceRefresh) => {
     set({ marketplaceLoading: true, marketplaceError: null })
     try {
       const [catalog, installed] = await Promise.all([
-        window.clui.fetchMarketplace(forceRefresh),
-        window.clui.listInstalledPlugins(),
+        window.coda.fetchMarketplace(forceRefresh),
+        window.coda.listInstalledPlugins(),
       ])
       if (catalog.error && catalog.plugins.length === 0) {
         set({ marketplaceError: catalog.error, marketplaceLoading: false })
@@ -700,7 +708,7 @@ export const useSessionStore = create<State>((set, get) => ({
     set((s) => ({
       marketplacePluginStates: { ...s.marketplacePluginStates, [plugin.id]: 'installing' },
     }))
-    const result = await window.clui.installPlugin(plugin.repo, plugin.installName, plugin.marketplace, plugin.sourcePath, plugin.isSkillMd)
+    const result = await window.coda.installPlugin(plugin.repo, plugin.installName, plugin.marketplace, plugin.sourcePath, plugin.isSkillMd)
     if (result.ok) {
       set((s) => ({
         marketplacePluginStates: { ...s.marketplacePluginStates, [plugin.id]: 'installed' as PluginStatus },
@@ -714,7 +722,7 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   uninstallMarketplacePlugin: async (plugin) => {
-    const result = await window.clui.uninstallPlugin(plugin.installName)
+    const result = await window.coda.uninstallPlugin(plugin.installName)
     if (result.ok) {
       set((s) => ({
         marketplacePluginStates: { ...s.marketplacePluginStates, [plugin.id]: 'not_installed' as PluginStatus },
@@ -732,8 +740,8 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   closeTab: (tabId) => {
-    window.clui.closeTab(tabId).catch(() => {})
-    window.clui.terminalDestroy(tabId).catch(() => {})
+    window.coda.closeTab(tabId).catch(() => {})
+    window.coda.terminalDestroy(tabId).catch(() => {})
     destroyTerminalInstance(tabId)
     // Clean up terminal UI state
     const termIds = get().terminalOpenTabIds
@@ -812,10 +820,10 @@ export const useSessionStore = create<State>((set, get) => ({
   resumeSession: async (sessionId, title, projectPath) => {
     const defaultDir = projectPath || get().staticInfo?.homePath || '~'
     try {
-      const { tabId } = await window.clui.createTab()
+      const { tabId } = await window.coda.createTab()
 
       // Load previous conversation messages from the JSONL file
-      const history = await window.clui.loadSession(sessionId, defaultDir).catch(() => [])
+      const history = await window.coda.loadSession(sessionId, defaultDir).catch(() => [])
       const messages: Message[] = history.map((m) => ({
         id: nextMsgId(),
         role: m.role as Message['role'],
@@ -883,7 +891,7 @@ export const useSessionStore = create<State>((set, get) => ({
     }))
   },
 
-  startBashCommand: (command) => {
+  startBashCommand: (command, execId) => {
     const { activeTabId } = get()
     const toolMsgId = nextMsgId()
     const now = Date.now()
@@ -897,6 +905,8 @@ export const useSessionStore = create<State>((set, get) => ({
         return {
           ...t,
           title,
+          bashExecuting: true,
+          bashExecId: execId,
           messages: [
             ...t.messages,
             { id: nextMsgId(), role: 'user' as const, content: `! ${command}`, userExecuted: true, timestamp: now },
@@ -905,20 +915,23 @@ export const useSessionStore = create<State>((set, get) => ({
         }
       }),
     }))
-    return toolMsgId
+    return { toolMsgId, tabId: activeTabId }
   },
 
-  completeBashCommand: (toolMsgId, command, stdout, stderr, exitCode) => {
-    const { activeTabId } = get()
+  completeBashCommand: (tabId, toolMsgId, command, stdout, stderr, exitCode) => {
+    const { activeTabId, isExpanded } = get()
     const outputParts: string[] = []
     if (stdout) outputParts.push(stdout.trimEnd())
     if (stderr) outputParts.push(`stderr: ${stderr.trimEnd()}`)
     if (exitCode !== null && exitCode !== 0) outputParts.push(`exit code: ${exitCode}`)
     set((s) => ({
       tabs: s.tabs.map((t) => {
-        if (t.id !== activeTabId) return t
+        if (t.id !== tabId) return t
         return {
           ...t,
+          bashExecuting: false,
+          bashExecId: null,
+          hasUnread: (t.id !== activeTabId || !isExpanded) ? true : t.hasUnread,
           bashResults: [...t.bashResults, { command, stdout, stderr }],
           messages: t.messages.map((m) =>
             m.id === toolMsgId
@@ -928,13 +941,14 @@ export const useSessionStore = create<State>((set, get) => ({
         }
       }),
     }))
+    playNotificationIfHidden()
   },
 
   // ─── Permission response ───
 
   respondPermission: (tabId, questionId, optionId) => {
     // Send to backend
-    window.clui.respondPermission(tabId, questionId, optionId).catch(() => {})
+    window.coda.respondPermission(tabId, questionId, optionId).catch(() => {})
 
     // Remove answered item from queue; show next tool's activity or clear
     set((s) => ({
@@ -984,7 +998,7 @@ export const useSessionStore = create<State>((set, get) => ({
   setBaseDirectory: (dir) => {
     useThemeStore.getState().addRecentBaseDirectory(dir)
     const { activeTabId } = get()
-    window.clui.resetTabSession(activeTabId)
+    window.coda.resetTabSession(activeTabId)
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.id === activeTabId
@@ -1113,7 +1127,7 @@ export const useSessionStore = create<State>((set, get) => ({
 
     // Send to backend — ControlPlane will queue if a run is active
     const { preferredModel } = get()
-    window.clui.prompt(activeTabId, requestId, {
+    window.coda.prompt(activeTabId, requestId, {
       prompt: fullPrompt,
       projectPath: resolvedPath,
       sessionId: tab.claudeSessionId || undefined,
@@ -1466,10 +1480,16 @@ export const useSessionStore = create<State>((set, get) => ({
 function persistTabs(): void {
   const { tabs, activeTabId } = useSessionStore.getState()
   const activeTab = tabs.find((t) => t.id === activeTabId)
+  // Persist tabs with a session OR tabs that have editor state for their directory
+  const dirsWithEditorState = new Set<string>()
+  for (const [dir, dirState] of useSessionStore.getState().fileEditorStates) {
+    if (dirState.files.length > 0) dirsWithEditorState.add(dir)
+  }
+
   const persistedTabs = tabs
-    .filter((t) => t.claudeSessionId)
+    .filter((t) => t.claudeSessionId || (t.hasChosenDirectory && dirsWithEditorState.has(t.workingDirectory)))
     .map((t) => ({
-      claudeSessionId: t.claudeSessionId!,
+      claudeSessionId: t.claudeSessionId,
       title: t.customTitle || t.title,
       customTitle: t.customTitle,
       workingDirectory: t.workingDirectory,
@@ -1485,8 +1505,11 @@ function persistTabs(): void {
   const editorStates: Record<string, any> = {}
   for (const [dir, dirState] of fileEditorStates) {
     if (dirState.files.length > 0) {
+      const activeIdx = dirState.activeFileId
+        ? dirState.files.findIndex((f) => f.id === dirState.activeFileId)
+        : -1
       editorStates[dir] = {
-        activeFileId: dirState.activeFileId,
+        activeFileIndex: activeIdx >= 0 ? activeIdx : 0,
         files: dirState.files.map((f) => ({
           filePath: f.filePath,
           fileName: f.fileName,
@@ -1500,17 +1523,47 @@ function persistTabs(): void {
     }
   }
 
+  // Resolve which persisted tabs have the editor open (by index into persistedTabs)
+  const { isExpanded, fileEditorOpenTabIds, editorGeometry } = useSessionStore.getState()
+  const editorOpenIndices: number[] = []
+  // Build a lookup from tab id -> persisted index
+  let persistedIdx = 0
+  for (const t of tabs) {
+    const isPersisted = t.claudeSessionId || (t.hasChosenDirectory && dirsWithEditorState.has(t.workingDirectory))
+    if (isPersisted) {
+      if (fileEditorOpenTabIds.has(t.id)) {
+        editorOpenIndices.push(persistedIdx)
+      }
+      persistedIdx++
+    }
+  }
+
+  // Resolve active tab as index into persistedTabs (handles sessionless tabs)
+  let activeTabIndex: number | null = null
+  persistedIdx = 0
+  for (const t of tabs) {
+    const isPersisted = t.claudeSessionId || (t.hasChosenDirectory && dirsWithEditorState.has(t.workingDirectory))
+    if (isPersisted) {
+      if (t.id === activeTabId) activeTabIndex = persistedIdx
+      persistedIdx++
+    }
+  }
+
   const data: PersistedTabState = {
     activeSessionId: activeTab?.claudeSessionId || null,
+    activeTabIndex,
     tabs: persistedTabs,
     editorStates: Object.keys(editorStates).length > 0 ? editorStates : undefined,
+    isExpanded,
+    editorOpenSessionIds: editorOpenIndices.length > 0 ? editorOpenIndices : undefined,
+    editorGeometry,
   }
-  window.clui.saveTabs(data)
+  window.coda.saveTabs(data)
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 useSessionStore.subscribe((state, prev) => {
-  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId || state.fileEditorStates !== prev.fileEditorStates) {
+  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId || state.fileEditorStates !== prev.fileEditorStates || state.isExpanded !== prev.isExpanded || state.fileEditorOpenTabIds !== prev.fileEditorOpenTabIds || state.editorGeometry !== prev.editorGeometry) {
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(persistTabs, 100)
   }
