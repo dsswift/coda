@@ -1,6 +1,6 @@
 #!/bin/bash
 # ──────────────────────────────────────────────────────
-#  Clui CC — Install App
+#  CODA — Install App
 #
 #  Double-click this file in Finder to:
 #   1. Set up dependencies
@@ -15,7 +15,7 @@ set -e
 # Resolve to repo root (one level up from commands/)
 cd "$(dirname "$0")/.."
 
-APP_NAME="Clui CC"
+APP_NAME="CODA"
 DEST="/Applications/${APP_NAME}.app"
 
 step() { echo; echo "═══ $1 ═══"; echo; }
@@ -140,17 +140,55 @@ fi
 
 step "Step 4/6 — Installing to /Applications"
 
-# Kill running instance before replacing the binary
-if pgrep -f "Clui CC" &>/dev/null; then
-  echo "${APP_NAME} is currently running."
-  echo
-  echo "  Switch to it now and close it cleanly, then come back"
-  echo "  and press Enter to continue. (Ctrl+C to abort)"
-  echo
-  read -r -p "Press Enter when ready... "
-  echo
-  echo "Force-killing any remaining ${APP_NAME} processes..."
-  pkill -9 -f "Clui CC" 2>/dev/null || true
+# Graceful shutdown of running instance
+APP_PID=""
+
+# Check packaged-app PID file (written by Electron main process)
+PACKAGED_PID_FILE="$HOME/Library/Application Support/CODA/coda.pid"
+if [ -f "$PACKAGED_PID_FILE" ]; then
+  APP_PID=$(cat "$PACKAGED_PID_FILE" 2>/dev/null)
+fi
+
+# Fallback: dev PID file
+if [ -z "$APP_PID" ] || ! kill -0 "$APP_PID" 2>/dev/null; then
+  if [ -f ".coda.pid" ]; then
+    APP_PID=$(cat ".coda.pid" 2>/dev/null)
+  fi
+fi
+
+# Fallback: pgrep
+if [ -z "$APP_PID" ] || ! kill -0 "$APP_PID" 2>/dev/null; then
+  APP_PID=$(pgrep -f "CODA.app/Contents/MacOS/CODA$" 2>/dev/null | head -1 || true)
+fi
+
+if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
+  echo "Signaling ${APP_NAME} to finish active agents and quit..."
+  kill -USR1 "$APP_PID" 2>/dev/null || true
+
+  # Wait up to 5 minutes for graceful exit
+  TIMEOUT=300
+  WAITED=0
+  while kill -0 "$APP_PID" 2>/dev/null && [ "$WAITED" -lt "$TIMEOUT" ]; do
+    sleep 1
+    WAITED=$((WAITED + 1))
+    if [ $((WAITED % 15)) -eq 0 ]; then
+      echo "  Waiting for agents to finish... (${WAITED}s)"
+    fi
+  done
+
+  if kill -0 "$APP_PID" 2>/dev/null; then
+    echo "Timeout — force killing ${APP_NAME}"
+    kill -9 "$APP_PID" 2>/dev/null || true
+    sleep 1
+  else
+    echo "${APP_NAME} shut down gracefully."
+  fi
+fi
+
+# Kill any stray helper processes (GPU, network, audio)
+STRAY_PIDS=$(pgrep -f "CODA.app/Contents" 2>/dev/null || true)
+if [ -n "$STRAY_PIDS" ]; then
+  kill -9 $STRAY_PIDS 2>/dev/null || true
   sleep 1
 fi
 

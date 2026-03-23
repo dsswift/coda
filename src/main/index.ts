@@ -19,8 +19,8 @@ import { isValidProjectPath, isValidSessionId, validateExternalUrl, buildTermina
 
 const gitExec = promisify(execFileCb)
 
-const DEBUG_MODE = process.env.CLUI_DEBUG === '1'
-const SPACES_DEBUG = DEBUG_MODE || process.env.CLUI_SPACES_DEBUG === '1'
+const DEBUG_MODE = process.env.CODA_DEBUG === '1'
+const SPACES_DEBUG = DEBUG_MODE || process.env.CODA_SPACES_DEBUG === '1'
 
 function log(msg: string): void {
   _log('main', msg)
@@ -30,9 +30,10 @@ let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let screenshotCounter = 0
 let toggleSequence = 0
+let forceQuit = false
 
 // Feature flag: enable PTY interactive permissions transport
-const INTERACTIVE_PTY = process.env.CLUI_INTERACTIVE_PERMISSIONS_PTY === '1'
+const INTERACTIVE_PTY = process.env.CODA_INTERACTIVE_PERMISSIONS_PTY === '1'
 
 const controlPlane = new ControlPlane(INTERACTIVE_PTY)
 
@@ -90,15 +91,15 @@ function scheduleToggleSnapshots(toggleId: number, phase: 'show' | 'hide'): void
 // ─── Wire ControlPlane events → renderer ───
 
 controlPlane.on('event', (tabId: string, event: NormalizedEvent) => {
-  broadcast('clui:normalized-event', tabId, event)
+  broadcast('coda:normalized-event', tabId, event)
 })
 
 controlPlane.on('tab-status-change', (tabId: string, newStatus: string, oldStatus: string) => {
-  broadcast('clui:tab-status-change', tabId, newStatus, oldStatus)
+  broadcast('coda:tab-status-change', tabId, newStatus, oldStatus)
 })
 
 controlPlane.on('error', (tabId: string, error: EnrichedError) => {
-  broadcast('clui:enriched-error', tabId, error)
+  broadcast('coda:enriched-error', tabId, error)
 })
 
 // ─── Window Creation ───
@@ -148,7 +149,6 @@ function createWindow(): void {
     }
   })
 
-  let forceQuit = false
   app.on('before-quit', (e) => {
     if (forceQuit) return
     e.preventDefault()
@@ -158,7 +158,7 @@ function createWindow(): void {
       buttons: ['Quit', 'Cancel'],
       defaultId: 1,
       cancelId: 1,
-      title: 'Quit Clui CC?',
+      title: 'Quit CODA?',
       message: hasRunning
         ? 'Sessions are still running. Quitting will stop them.'
         : 'Are you sure you want to quit?',
@@ -167,11 +167,14 @@ function createWindow(): void {
     if (choice === 0) {
       forceQuit = true
       terminalManager.destroyAll()
+      controlPlane.shutdown()
+      globalShortcut.unregisterAll()
       if (tray) {
         tray.destroy()
         tray = null
       }
-      app.quit()
+      flushLogs()
+      app.exit(0)
     }
   })
   mainWindow.on('close', (e) => {
@@ -196,7 +199,7 @@ function createTray(): void {
   const trayIcon = nativeImage.createFromPath(trayIconPath)
   trayIcon.setTemplateImage(true)
   tray = new Tray(trayIcon)
-  tray.setToolTip('Clui CC — Claude Code UI')
+  tray.setToolTip('CODA — Claude Overlay Dev Assistant')
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: 'Toggle Interface', accelerator: 'Alt+Space', click: () => toggleWindow('tray menu') },
@@ -433,6 +436,7 @@ ipcMain.handle(IPC.EXECUTE_BASH, async (_event, { id, command, cwd }: { id: stri
 
     child.on('close', (code) => {
       bashProcesses.delete(id)
+      controlPlane.notifyExternalWorkDone()
       resolve({
         stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
         stderr: Buffer.concat(stderrChunks).toString('utf-8'),
@@ -442,6 +446,7 @@ ipcMain.handle(IPC.EXECUTE_BASH, async (_event, { id, command, cwd }: { id: stri
 
     child.on('error', (err) => {
       bashProcesses.delete(id)
+      controlPlane.notifyExternalWorkDone()
       resolve({ stdout: '', stderr: err.message, exitCode: 1 })
     })
   })
@@ -646,7 +651,7 @@ function extractTag(text: string, tag: string): string | null {
 }
 
 /**
- * Extract CLUI-prepended bash command results from a user message.
+ * Extract CODA-prepended bash command results from a user message.
  * Pattern: "$ command\n```\noutput\n```" optionally followed by more bash entries,
  * then the actual user message.
  */
@@ -749,7 +754,7 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
             } else {
               const text = cleanCliTags(raw)
               if (text) {
-                // Detect CLUI bash command results prepended to prompts: $ cmd\n```\noutput\n```
+                // Detect CODA bash command results prepended to prompts: $ cmd\n```\noutput\n```
                 const { bashEntries, remainder } = extractBashEntries(text)
                 for (const entry of bashEntries) {
                   messages.push({ role: 'user', content: `! ${entry.command}`, userExecuted: true, timestamp: ts })
@@ -813,7 +818,7 @@ ipcMain.handle(IPC.SELECT_DIRECTORY, async () => {
   if (!mainWindow) return null
   // macOS: activate app so unparented dialog appears on top (not behind other apps).
   // Unparented avoids modal dimming on the transparent overlay.
-  // Activation is fine here — user is actively interacting with CLUI.
+  // Activation is fine here — user is actively interacting with CODA.
   if (process.platform === 'darwin') app.focus()
   const options = { properties: ['openDirectory' as const] }
   const result = process.platform === 'darwin'
@@ -901,7 +906,7 @@ ipcMain.handle(IPC.TAKE_SCREENSHOT, async () => {
     const { readFileSync, existsSync } = require('fs')
 
     const timestamp = Date.now()
-    const screenshotPath = join(tmpdir(), `clui-screenshot-${timestamp}.png`)
+    const screenshotPath = join(tmpdir(), `coda-screenshot-${timestamp}.png`)
 
     execSync(`/usr/sbin/screencapture -i "${screenshotPath}"`, {
       timeout: 30000,
@@ -953,7 +958,7 @@ ipcMain.handle(IPC.PASTE_IMAGE, async (_event, dataUrl: string) => {
     const [, mimeType, ext, base64Data] = match
     const buf = Buffer.from(base64Data, 'base64')
     const timestamp = Date.now()
-    const filePath = join(tmpdir(), `clui-paste-${timestamp}.${ext}`)
+    const filePath = join(tmpdir(), `coda-paste-${timestamp}.${ext}`)
     writeFileSync(filePath, buf)
 
     return {
@@ -976,7 +981,7 @@ ipcMain.handle(IPC.TRANSCRIBE_AUDIO, async (_event, audioBase64: string) => {
   const { join, basename } = require('path')
   const { tmpdir } = require('os')
 
-  const tmpWav = join(tmpdir(), `clui-voice-${Date.now()}.wav`)
+  const tmpWav = join(tmpdir(), `coda-voice-${Date.now()}.wav`)
   try {
     const runExecFile = (bin: string, args: string[], timeout: number): Promise<string> =>
       new Promise((resolve, reject) => {
@@ -1246,9 +1251,9 @@ ipcMain.handle(IPC.MARKETPLACE_UNINSTALL, async (_event, { pluginName }: { plugi
 
 // ─── Settings Persistence ───
 
-const SETTINGS_DIR = join(homedir(), '.clui')
+const SETTINGS_DIR = join(homedir(), '.coda')
 const SETTINGS_FILE = join(SETTINGS_DIR, 'settings.json')
-const SETTINGS_DEFAULTS = { themeMode: 'dark', soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', showDirLabel: false, preferredOpenWith: 'cli', showImplementClearContext: false, expandToolResults: false, terminalFontFamily: 'Menlo, Monaco, monospace', terminalFontSize: 13 }
+const SETTINGS_DEFAULTS = { themeMode: 'dark', soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', showDirLabel: true, preferredOpenWith: 'cli', showImplementClearContext: false, expandToolResults: false, terminalFontFamily: 'Menlo, Monaco, monospace', terminalFontSize: 13 }
 
 ipcMain.handle(IPC.LOAD_SETTINGS, () => {
   try {
@@ -1768,6 +1773,12 @@ app.whenReady().then(async () => {
   createWindow()
   snapshotWindowState('after createWindow')
 
+  // Write PID file so install/stop scripts can signal this process
+  const pidDir = app.getPath('userData')
+  const pidPath = join(pidDir, 'coda.pid')
+  writeFileSync(pidPath, String(process.pid))
+  log(`PID file written: ${pidPath} (${process.pid})`)
+
   // Custom application menu: preserve standard edit shortcuts but remove Cmd+W close-window
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     {
@@ -1846,7 +1857,38 @@ app.on('will-quit', () => {
     tray.destroy()
     tray = null
   }
+  // Remove PID file
+  try { rmSync(join(app.getPath('userData'), 'coda.pid')) } catch {}
   flushLogs()
+})
+
+// Graceful drain: install script sends SIGUSR1 to let active agents finish before quit
+process.on('SIGUSR1', () => {
+  log('SIGUSR1 received — draining active work before quit')
+  const timeout = setTimeout(() => {
+    log('Drain timeout (5min) — force quitting')
+    forceQuit = true
+    terminalManager.destroyAll()
+    controlPlane.shutdown()
+    globalShortcut.unregisterAll()
+    if (tray) { tray.destroy(); tray = null }
+    try { rmSync(join(app.getPath('userData'), 'coda.pid')) } catch {}
+    flushLogs()
+    app.exit(0)
+  }, 5 * 60 * 1000)
+
+  controlPlane.drain(() => bashProcesses.size > 0).then(() => {
+    clearTimeout(timeout)
+    log('All agents finished — quitting')
+    forceQuit = true
+    terminalManager.destroyAll()
+    controlPlane.shutdown()
+    globalShortcut.unregisterAll()
+    if (tray) { tray.destroy(); tray = null }
+    try { rmSync(join(app.getPath('userData'), 'coda.pid')) } catch {}
+    flushLogs()
+    app.exit(0)
+  })
 })
 
 app.on('window-all-closed', () => {

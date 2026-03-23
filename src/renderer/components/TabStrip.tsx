@@ -19,11 +19,12 @@ const PILL_COLOR_PRESETS = [
   { color: '#c4a84d', label: 'Gold' },
 ] as const
 
-function StatusDot({ status, hasUnread, hasPermission }: { status: TabStatus; hasUnread: boolean; hasPermission: boolean }) {
+function StatusDot({ status, hasUnread, hasPermission, bashExecuting }: { status: TabStatus; hasUnread: boolean; hasPermission: boolean; bashExecuting: boolean }) {
   const colors = useColors()
   let bg: string = colors.statusIdle
   let pulse = false
   let glow = false
+  let glowColor = colors.statusPermissionGlow
 
   if (status === 'dead' || status === 'failed') {
     bg = colors.statusError
@@ -33,6 +34,11 @@ function StatusDot({ status, hasUnread, hasPermission }: { status: TabStatus; ha
   } else if (status === 'connecting' || status === 'running') {
     bg = colors.statusRunning
     pulse = true
+  } else if (bashExecuting) {
+    bg = colors.statusBash
+    pulse = true
+    glow = true
+    glowColor = colors.statusBashGlow
   } else if (hasUnread) {
     bg = colors.statusComplete
   }
@@ -42,7 +48,7 @@ function StatusDot({ status, hasUnread, hasPermission }: { status: TabStatus; ha
       className={`w-[6px] h-[6px] rounded-full flex-shrink-0 ${pulse ? 'animate-pulse-dot' : ''}`}
       style={{
         background: bg,
-        ...(glow ? { boxShadow: `0 0 6px 2px ${colors.statusPermissionGlow}` } : {}),
+        ...(glow ? { boxShadow: `0 0 6px 2px ${glowColor}` } : {}),
       }}
     />
   )
@@ -83,7 +89,7 @@ function PillColorPicker({
   return createPortal(
     <motion.div
       ref={ref}
-      data-clui-ui
+      data-coda-ui
       initial={{ opacity: 0, scale: 0.9 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.9 }}
@@ -167,7 +173,7 @@ function DirContextMenu({
   return createPortal(
     <motion.div
       ref={ref}
-      data-clui-ui
+      data-coda-ui
       initial={{ opacity: 0, scale: 0.9 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.9 }}
@@ -240,7 +246,7 @@ function RecentDirsContextMenu({
   return createPortal(
     <motion.div
       ref={ref}
-      data-clui-ui
+      data-coda-ui
       initial={{ opacity: 0, scale: 0.9 }}
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.9 }}
@@ -256,7 +262,6 @@ function RecentDirsContextMenu({
         padding: 4,
         zIndex: 10000,
         minWidth: 180,
-        maxWidth: 320,
       }}
     >
       {recentDirs.length === 0 ? (
@@ -287,7 +292,7 @@ function RecentDirsContextMenu({
               onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
             >
               <FolderOpen size={14} color={colors.textSecondary} style={{ flexShrink: 0 }} />
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayPath}</span>
+              <span style={{ whiteSpace: 'nowrap' }}>{displayPath}</span>
             </button>
           )
         })
@@ -437,7 +442,7 @@ function TabPill({
   const hasCustomTitle = !!tab.customTitle
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
-    if (e.button === 1) { e.preventDefault(); onClose(); return }
+    if (e.button === 1) { e.preventDefault(); if (!isRunning && !tab.bashExecuting) onClose(); return }
     if (e.button !== 0) return
     dragOrigin.current = { x: e.clientX, y: e.clientY }
     isDragging.current = false
@@ -499,7 +504,7 @@ function TabPill({
           onOpenColorPicker(tab.id, { x: e.clientX, y: e.clientY })
         }}
       >
-        <StatusDot status={tab.status} hasUnread={tab.hasUnread} hasPermission={tab.permissionQueue.length > 0} />
+        <StatusDot status={tab.status} hasUnread={tab.hasUnread} hasPermission={tab.permissionQueue.length > 0} bashExecuting={tab.bashExecuting} />
       </span>
       {showDirLabel && tab.workingDirectory && (
         <span
@@ -621,8 +626,8 @@ export function TabStrip() {
       const rect = plusButtonRef.current.getBoundingClientRect()
       setRecentDirsMenu({ x: rect.left, y: rect.bottom })
     }
-    window.addEventListener('clui:open-recent-dirs', handler)
-    return () => window.removeEventListener('clui:open-recent-dirs', handler)
+    window.addEventListener('coda:open-recent-dirs', handler)
+    return () => window.removeEventListener('coda:open-recent-dirs', handler)
   }, [])
 
   // Convert vertical wheel to horizontal scroll
@@ -633,12 +638,12 @@ export function TabStrip() {
   }, [])
 
   if (!tabsReady) {
-    return <div data-clui-ui className="flex items-center no-drag" style={{ padding: '8px 0', height: 40 }} />
+    return <div data-coda-ui className="flex items-center no-drag" style={{ padding: '8px 0', height: 40 }} />
   }
 
   return (
     <div
-      data-clui-ui
+      data-coda-ui
       className="flex items-center no-drag"
       style={{ padding: '8px 0' }}
     >
