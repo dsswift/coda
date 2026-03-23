@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, CatalogPlugin, PluginStatus, PersistedTabState } from '../../shared/types'
+import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, FileAttachment, CatalogPlugin, PluginStatus, PersistedTabState } from '../../shared/types'
 import { useThemeStore } from '../theme'
 import { destroyTerminalInstance } from '../components/TerminalPanel'
 import notificationSrc from '../../../resources/notification.mp3'
@@ -83,6 +83,8 @@ interface State {
   fileEditorStates: Map<string, FileEditorDirState>
   /** Global file editor window position and size (persisted across restarts) */
   editorGeometry: { x: number; y: number; w: number; h: number }
+  /** Global plan preview window position and size (persisted across restarts) */
+  planGeometry: { x: number; y: number; w: number; h: number }
   /** Whether tab restoration has completed (prevents placeholder flash) */
   tabsReady: boolean
 
@@ -136,6 +138,7 @@ interface State {
   toggleEditorPreview: (dir: string, fileId: string) => void
   toggleEditorReadOnly: (dir: string, fileId: string) => void
   setEditorGeometry: (geo: { x: number; y: number; w: number; h: number }) => void
+  setPlanGeometry: (geo: { x: number; y: number; w: number; h: number }) => void
   loadMarketplace: (forceRefresh?: boolean) => Promise<void>
   setMarketplaceSearch: (query: string) => void
   setMarketplaceFilter: (filter: string) => void
@@ -146,12 +149,12 @@ interface State {
   addSystemMessage: (content: string) => void
   startBashCommand: (command: string, execId: string) => { toolMsgId: string; tabId: string }
   completeBashCommand: (tabId: string, toolMsgId: string, command: string, stdout: string, stderr: string, exitCode: number | null) => void
-  sendMessage: (prompt: string, projectPath?: string) => void
+  sendMessage: (prompt: string, projectPath?: string, extraAttachments?: Attachment[]) => void
   respondPermission: (tabId: string, questionId: string, optionId: string) => void
   addDirectory: (dir: string) => void
   removeDirectory: (dir: string) => void
   setBaseDirectory: (dir: string) => void
-  addAttachments: (attachments: Attachment[]) => void
+  addAttachments: (attachments: FileAttachment[]) => void
   removeAttachment: (attachmentId: string) => void
   clearAttachments: () => void
   handleNormalizedEvent: (tabId: string, event: NormalizedEvent) => void
@@ -225,6 +228,7 @@ export const useSessionStore = create<State>((set, get) => ({
   fileEditorFocused: true,
   fileEditorStates: new Map(),
   editorGeometry: { x: 60, y: 80, w: 680, h: 480 },
+  planGeometry: { x: 60, y: 80, w: 720, h: 420 },
   tabsReady: false,
 
   // Settings dialog
@@ -274,6 +278,9 @@ export const useSessionStore = create<State>((set, get) => ({
     const defaultBase = useThemeStore.getState().defaultBaseDirectory
     const startDir = defaultBase || homeDir
     const hasChosen = !!defaultBase
+    const { activeTabId: prevTabId, tabs: prevTabs, fileEditorOpenTabIds: prevEditorOpen } = get()
+    const prevTab = prevTabs.find((t) => t.id === prevTabId)
+    const inheritEditor = prevTab && prevEditorOpen.has(prevTab.id) && prevTab.workingDirectory === startDir
     try {
       const { tabId } = await window.coda.createTab()
       const tab: TabState = {
@@ -285,6 +292,7 @@ export const useSessionStore = create<State>((set, get) => ({
       set((s) => ({
         tabs: [...s.tabs, tab],
         activeTabId: tab.id,
+        ...(inheritEditor ? { fileEditorOpenTabIds: new Set([...s.fileEditorOpenTabIds, tab.id]) } : {}),
       }))
       return tabId
     } catch {
@@ -294,6 +302,7 @@ export const useSessionStore = create<State>((set, get) => ({
       set((s) => ({
         tabs: [...s.tabs, tab],
         activeTabId: tab.id,
+        ...(inheritEditor ? { fileEditorOpenTabIds: new Set([...s.fileEditorOpenTabIds, tab.id]) } : {}),
       }))
       return tab.id
     }
@@ -301,6 +310,9 @@ export const useSessionStore = create<State>((set, get) => ({
 
   createTabInDirectory: async (dir) => {
     useThemeStore.getState().addRecentBaseDirectory(dir)
+    const { activeTabId: prevTabId, tabs: prevTabs, fileEditorOpenTabIds: prevEditorOpen } = get()
+    const prevTab = prevTabs.find((t) => t.id === prevTabId)
+    const inheritEditor = prevTab && prevEditorOpen.has(prevTab.id) && prevTab.workingDirectory === dir
     try {
       const { tabId } = await window.coda.createTab()
       const tab: TabState = {
@@ -312,6 +324,7 @@ export const useSessionStore = create<State>((set, get) => ({
       set((s) => ({
         tabs: [...s.tabs, tab],
         activeTabId: tab.id,
+        ...(inheritEditor ? { fileEditorOpenTabIds: new Set([...s.fileEditorOpenTabIds, tab.id]) } : {}),
       }))
       return tabId
     } catch {
@@ -321,6 +334,7 @@ export const useSessionStore = create<State>((set, get) => ({
       set((s) => ({
         tabs: [...s.tabs, tab],
         activeTabId: tab.id,
+        ...(inheritEditor ? { fileEditorOpenTabIds: new Set([...s.fileEditorOpenTabIds, tab.id]) } : {}),
       }))
       return tab.id
     }
@@ -659,6 +673,7 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   setEditorGeometry: (geo) => set({ editorGeometry: geo }),
+  setPlanGeometry: (geo) => set({ planGeometry: geo }),
 
   loadMarketplace: async (forceRefresh) => {
     set({ marketplaceLoading: true, marketplaceError: null })
@@ -833,6 +848,7 @@ export const useSessionStore = create<State>((set, get) => ({
         toolInput: m.toolInput,
         toolStatus: m.toolName ? 'completed' as const : undefined,
         userExecuted: m.userExecuted,
+        attachments: m.attachments,
         timestamp: m.timestamp,
       }))
 
@@ -1049,7 +1065,7 @@ export const useSessionStore = create<State>((set, get) => ({
 
   // ─── Send ───
 
-  sendMessage: (prompt, projectPath) => {
+  sendMessage: (prompt, projectPath, extraAttachments) => {
     const { activeTabId, tabs, staticInfo } = get()
     const tab = tabs.find((t) => t.id === activeTabId)
     // Use explicitly chosen directory, otherwise fall back to user home
@@ -1059,8 +1075,20 @@ export const useSessionStore = create<State>((set, get) => ({
     // Guard: don't send while connecting (warmup in progress)
     if (tab.status === 'connecting') return
 
+    // Slash commands are action-oriented -- auto-switch out of plan mode
+    // so the command can execute tools without manual approval
+    if (!tab.claudeSessionId && tab.permissionMode === 'plan' && prompt.startsWith('/')) {
+      get().setPermissionMode('auto')
+    }
+
     const isBusy = tab.status === 'running'
     const requestId = crypto.randomUUID()
+
+    // Combine file attachments from tab with any extra attachments (e.g. plan)
+    const msgAttachments: Attachment[] = [
+      ...tab.attachments,
+      ...(extraAttachments || []),
+    ]
 
     // Build full prompt with bash results and attachment context
     let fullPrompt = prompt
@@ -1119,7 +1147,13 @@ export const useSessionStore = create<State>((set, get) => ({
           permissionDenied: null,
           messages: [
             ...withEffectiveBase.messages,
-            { id: nextMsgId(), role: 'user' as const, content: prompt, timestamp: Date.now() },
+            {
+              id: nextMsgId(),
+              role: 'user' as const,
+              content: prompt,
+              attachments: msgAttachments.length > 0 ? msgAttachments : undefined,
+              timestamp: Date.now(),
+            },
           ],
         }
       }),
@@ -1524,7 +1558,7 @@ function persistTabs(): void {
   }
 
   // Resolve which persisted tabs have the editor open (by index into persistedTabs)
-  const { isExpanded, fileEditorOpenTabIds, editorGeometry } = useSessionStore.getState()
+  const { isExpanded, fileEditorOpenTabIds, editorGeometry, planGeometry } = useSessionStore.getState()
   const editorOpenIndices: number[] = []
   // Build a lookup from tab id -> persisted index
   let persistedIdx = 0
@@ -1557,13 +1591,14 @@ function persistTabs(): void {
     isExpanded,
     editorOpenSessionIds: editorOpenIndices.length > 0 ? editorOpenIndices : undefined,
     editorGeometry,
+    planGeometry,
   }
   window.coda.saveTabs(data)
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 useSessionStore.subscribe((state, prev) => {
-  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId || state.fileEditorStates !== prev.fileEditorStates || state.isExpanded !== prev.isExpanded || state.fileEditorOpenTabIds !== prev.fileEditorOpenTabIds || state.editorGeometry !== prev.editorGeometry) {
+  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId || state.fileEditorStates !== prev.fileEditorStates || state.isExpanded !== prev.isExpanded || state.fileEditorOpenTabIds !== prev.fileEditorOpenTabIds || state.editorGeometry !== prev.editorGeometry || state.planGeometry !== prev.planGeometry) {
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(persistTabs, 100)
   }

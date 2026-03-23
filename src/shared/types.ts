@@ -129,7 +129,7 @@ export interface PermissionRequest {
   options: Array<{ optionId: string; kind?: string; label: string }>
 }
 
-export interface Attachment {
+export interface FileAttachment {
   id: string
   type: 'image' | 'file'
   name: string
@@ -141,6 +141,15 @@ export interface Attachment {
   size?: number
 }
 
+export interface PlanAttachment {
+  id: string
+  type: 'plan'
+  name: string
+  path: string
+}
+
+export type Attachment = FileAttachment | PlanAttachment
+
 export interface TabState {
   id: string
   claudeSessionId: string | null
@@ -151,7 +160,7 @@ export interface TabState {
   permissionQueue: PermissionRequest[]
   /** Fallback card when tools were denied and no interactive permission is available */
   permissionDenied: { tools: Array<{ toolName: string; toolUseId: string }> } | null
-  attachments: Attachment[]
+  attachments: FileAttachment[]
   messages: Message[]
   title: string
   /** User-provided custom tab name (overrides auto-generated title when set) */
@@ -196,6 +205,8 @@ export interface Message {
   userExecuted?: boolean
   /** True when the expand-tool-results setting auto-expanded this result */
   autoExpandResult?: boolean
+  /** File or plan attachments associated with this message */
+  attachments?: Attachment[]
   timestamp: number
 }
 
@@ -284,6 +295,7 @@ export interface SessionMeta {
   sessionId: string
   slug: string | null
   firstMessage: string | null
+  lastResponse: string | null
   lastTimestamp: string
   size: number
 }
@@ -295,6 +307,7 @@ export interface SessionLoadMessage {
   toolId?: string
   toolInput?: string
   userExecuted?: boolean
+  attachments?: Attachment[]
   timestamp: number
 }
 
@@ -488,6 +501,8 @@ export interface PersistedTabState {
   editorOpenSessionIds?: number[]
   /** Global file editor window position and size */
   editorGeometry?: { x: number; y: number; w: number; h: number }
+  /** Global plan preview window position and size */
+  planGeometry?: { x: number; y: number; w: number; h: number }
 }
 
 // ─── Git Types ───

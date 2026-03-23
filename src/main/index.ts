@@ -552,7 +552,7 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
     }
     const files = readdirSync(sessionsDir).filter((f: string) => f.endsWith('.jsonl'))
 
-    const sessions: Array<{ sessionId: string; slug: string | null; firstMessage: string | null; lastTimestamp: string; size: number }> = []
+    const sessions: Array<{ sessionId: string; slug: string | null; firstMessage: string | null; lastResponse: string | null; lastTimestamp: string; size: number }> = []
 
     // UUID v4 regex — only consider files named as valid UUIDs
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -567,8 +567,8 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
       if (stat.size < 100) continue // skip trivially small files
 
       // Read lines to extract metadata and validate transcript schema
-      const meta: { validated: boolean; slug: string | null; firstMessage: string | null; lastTimestamp: string | null } = {
-        validated: false, slug: null, firstMessage: null, lastTimestamp: null,
+      const meta: { validated: boolean; slug: string | null; firstMessage: string | null; lastResponse: string | null; lastTimestamp: string | null } = {
+        validated: false, slug: null, firstMessage: null, lastResponse: null, lastTimestamp: null,
       }
 
       await new Promise<void>((resolve) => {
@@ -606,6 +606,20 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
                 }
               }
             }
+            // Extract last assistant response (overwrites each time so we keep the final one)
+            if (obj.type === 'assistant') {
+              const content = obj.message?.content
+              let raw = ''
+              if (typeof content === 'string') {
+                raw = content
+              } else if (Array.isArray(content)) {
+                raw = (content.find((p: any) => p.type === 'text')?.text) || ''
+              }
+              if (raw) {
+                const cleaned = cleanCliTags(raw).substring(0, 100)
+                if (cleaned) meta.lastResponse = cleaned
+              }
+            }
           } catch {}
           // Read all lines to get the last timestamp
         })
@@ -617,6 +631,7 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
           sessionId: fileSessionId,
           slug: meta.slug,
           firstMessage: meta.firstMessage,
+          lastResponse: meta.lastResponse,
           lastTimestamp: meta.lastTimestamp || stat.mtime.toISOString(),
           size: stat.size,
         })
@@ -690,7 +705,54 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
     const filePath = join(homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)
     if (!existsSync(filePath)) return []
 
-    const messages: Array<{ role: string; content: string; toolName?: string; toolInput?: string; toolId?: string; userExecuted?: boolean; timestamp: number }> = []
+    const messages: Array<{ role: string; content: string; toolName?: string; toolInput?: string; toolId?: string; userExecuted?: boolean; attachments?: Array<{ id: string; type: string; name: string; path: string; mimeType?: string }>; timestamp: number }> = []
+
+    // MIME type lookup for reconstructing attachments from history
+    const extToMime: Record<string, string> = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+      '.txt': 'text/plain', '.md': 'text/markdown',
+      '.json': 'application/json', '.yaml': 'text/yaml', '.yml': 'text/yaml',
+      '.toml': 'text/toml', '.ts': 'text/typescript', '.tsx': 'text/typescript',
+      '.js': 'text/javascript', '.py': 'text/x-python', '.rs': 'text/x-rust',
+      '.go': 'text/x-go',
+    }
+
+    // Extract [Attached type: path] lines from text, returning attachments and cleaned text
+    const parseAttachmentLines = (text: string) => {
+      const attachmentRegex = /^\[Attached (image|file): (.+)\]$/gm
+      const attachments: Array<{ id: string; type: 'image' | 'file'; name: string; path: string; mimeType?: string }> = []
+      let match
+      while ((match = attachmentRegex.exec(text)) !== null) {
+        const aType = match[1] as 'image' | 'file'
+        const aPath = match[2]
+        const aName = aPath.split('/').pop() || aPath
+        const aExt = aName.includes('.') ? '.' + aName.split('.').pop()!.toLowerCase() : ''
+        attachments.push({
+          id: `hist-${Date.now()}-${attachments.length}`,
+          type: aType,
+          name: aName,
+          path: aPath,
+          mimeType: extToMime[aExt],
+        })
+      }
+      const cleaned = text.replace(/^\[Attached (?:image|file): .+\]\n*/gm, '').trim()
+      return { attachments, cleaned }
+    }
+
+    // Find last ExitPlanMode tool message's planFilePath
+    const findLastPlanFilePath = () => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]
+        if (m.toolName === 'ExitPlanMode' && m.toolInput) {
+          try {
+            const input = JSON.parse(m.toolInput)
+            if (input.planFilePath) return input.planFilePath as string
+          } catch {}
+        }
+      }
+      return null
+    }
     await new Promise<void>((resolve) => {
       const rl = createInterface({ input: createReadStream(filePath) })
       rl.on('line', (line: string) => {
@@ -768,7 +830,30 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
                   })
                 }
                 if (remainder.trim()) {
-                  messages.push({ role: 'user', content: remainder.trim(), timestamp: ts })
+                  const { attachments: fileAttachments, cleaned } = parseAttachmentLines(remainder.trim())
+                  const allAttachments: typeof fileAttachments = [...fileAttachments]
+
+                  // Detect plan implementation messages and attach plan reference
+                  const isImplementMsg = cleaned === 'Implement the plan' || cleaned.startsWith('Implement the following plan:')
+                  if (isImplementMsg) {
+                    const planPath = findLastPlanFilePath()
+                    if (planPath) {
+                      const planName = planPath.split('/').pop() || planPath
+                      allAttachments.push({ id: `plan-${Date.now()}`, type: 'plan' as any, name: planName, path: planPath })
+                    }
+                  }
+
+                  // For plan implementation messages with embedded content, show short display text
+                  const displayContent = isImplementMsg && cleaned.startsWith('Implement the following plan:')
+                    ? 'Implement the plan'
+                    : cleaned
+
+                  messages.push({
+                    role: 'user',
+                    content: displayContent,
+                    attachments: allAttachments.length > 0 ? allAttachments : undefined,
+                    timestamp: ts,
+                  })
                 }
               }
             }
@@ -842,13 +927,17 @@ ipcMain.handle(IPC.ATTACH_FILES, async () => {
   if (!mainWindow) return null
   // macOS: activate app so unparented dialog appears on top
   if (process.platform === 'darwin') app.focus()
-  const options = {
+  // macOS NSOpenPanel doesn't reliably handle extensions: ['*'] — omit filters
+  // so all files are selectable. Other platforms get type filter dropdowns.
+  const options: Electron.OpenDialogOptions = {
     properties: ['openFile' as const, 'multiSelections' as const],
-    filters: [
-      { name: 'All Files', extensions: ['*'] },
-      { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
-      { name: 'Code', extensions: ['ts', 'tsx', 'js', 'jsx', 'py', 'rs', 'go', 'md', 'json', 'yaml', 'toml'] },
-    ],
+    ...(process.platform !== 'darwin' && {
+      filters: [
+        { name: 'All Files', extensions: ['*'] },
+        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
+        { name: 'Code', extensions: ['ts', 'tsx', 'js', 'jsx', 'py', 'rs', 'go', 'md', 'json', 'yaml', 'toml'] },
+      ],
+    }),
   }
   const result = process.platform === 'darwin'
     ? await dialog.showOpenDialog(options)
