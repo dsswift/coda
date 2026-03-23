@@ -1,4 +1,4 @@
-import React, { useEffect, useCallback } from 'react'
+import React, { useEffect, useCallback, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Paperclip, Camera, HeadCircuit } from '@phosphor-icons/react'
 import { GitPanel } from './components/GitPanel'
@@ -9,7 +9,10 @@ import { StatusBar } from './components/StatusBar'
 import { MarketplacePanel } from './components/MarketplacePanel'
 import { SettingsDialog } from './components/SettingsDialog'
 import { TerminalPanel } from './components/TerminalPanel'
-import { PopoverLayerProvider } from './components/PopoverLayer'
+import { FileExplorer } from './components/FileExplorer'
+import { FileEditor } from './components/FileEditor'
+import { PopoverLayerProvider, usePopoverLayer } from './components/PopoverLayer'
+import { createPortal } from 'react-dom'
 import { useClaudeEvents } from './hooks/useClaudeEvents'
 import { useHealthReconciliation } from './hooks/useHealthReconciliation'
 import { useSessionStore } from './stores/sessionStore'
@@ -17,9 +20,110 @@ import { useColors, useThemeStore, spacing } from './theme'
 
 const TRANSITION = { duration: 0.26, ease: [0.4, 0, 0.1, 1] as const }
 
+function CloseTabConfirmDialog({
+  title,
+  directory,
+  onConfirm,
+  onCancel,
+}: {
+  title: string
+  directory: string
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const colors = useColors()
+  const popoverLayer = usePopoverLayer()
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel()
+      if (e.key === 'Enter') onConfirm()
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [onCancel, onConfirm])
+
+  if (!popoverLayer) return null
+
+  return createPortal(
+    <motion.div
+      data-clui-ui
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      onClick={onCancel}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0, 0, 0, 0.4)',
+        pointerEvents: 'auto',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <motion.div
+        data-clui-ui
+        initial={{ opacity: 0, scale: 0.96 }}
+        animate={{ opacity: 1, scale: 1 }}
+        exit={{ opacity: 0, scale: 0.96 }}
+        transition={TRANSITION}
+        onClick={(e) => e.stopPropagation()}
+        className="glass-surface"
+        style={{
+          width: 320,
+          borderRadius: 16,
+          padding: 20,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 12,
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600, color: colors.textPrimary }}>
+          Close tab?
+        </div>
+        <div style={{ fontSize: 11, color: colors.textSecondary, lineHeight: 1.5 }}>
+          <div style={{ fontWeight: 500 }}>{title}</div>
+          <div style={{ color: colors.textTertiary, marginTop: 2 }}>{directory}</div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 4 }}>
+          <button
+            onClick={onCancel}
+            className="px-3 py-1 rounded-lg text-[11px]"
+            style={{
+              color: colors.textSecondary,
+              background: colors.surfacePrimary,
+              border: `1px solid ${colors.containerBorder}`,
+              cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="px-3 py-1 rounded-lg text-[11px]"
+            style={{
+              color: '#fff',
+              background: colors.accent,
+              border: 'none',
+              cursor: 'pointer',
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </motion.div>
+    </motion.div>,
+    popoverLayer,
+  )
+}
+
 export default function App() {
   useClaudeEvents()
   useHealthReconciliation()
+
+  const [closeConfirmTab, setCloseConfirmTab] = useState<{ id: string; title: string; directory: string } | null>(null)
 
   const settingsOpen = useSessionStore((s) => s.settingsOpen)
   const activeTabStatus = useSessionStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.status)
@@ -103,6 +207,31 @@ export default function App() {
           }))
         }
 
+        // Restore editor states (per-directory)
+        if (saved.editorStates) {
+          const restoredEditorStates = new Map<string, any>()
+          for (const [dir, dirState] of Object.entries(saved.editorStates as Record<string, any>)) {
+            if (dirState && dirState.files && dirState.files.length > 0) {
+              let fileIdCounter = 0
+              const files = dirState.files.map((f: any) => ({
+                id: `restored-${dir}-${fileIdCounter++}`,
+                filePath: f.filePath,
+                fileName: f.fileName,
+                content: f.content || '',
+                savedContent: f.savedContent || '',
+                isDirty: f.isDirty || false,
+                isReadOnly: f.isReadOnly || false,
+                isPreview: f.isPreview || false,
+              }))
+              const activeFileId = files.length > 0 ? files[0].id : null
+              restoredEditorStates.set(dir, { activeFileId, files })
+            }
+          }
+          if (restoredEditorStates.size > 0) {
+            useSessionStore.setState({ fileEditorStates: restoredEditorStates })
+          }
+        }
+
         // Auto-expand if setting enabled, otherwise stay collapsed
         const expandOnSwitch = useThemeStore.getState().expandOnTabSwitch
         useSessionStore.setState({ isExpanded: expandOnSwitch, tabsReady: true })
@@ -174,13 +303,101 @@ export default function App() {
     }
   }, [])
 
+  // ─── Keyboard shortcuts ───
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.metaKey && e.key === '1') {
+        e.preventDefault()
+        const id = useSessionStore.getState().activeTabId
+        useSessionStore.getState().toggleFileExplorer(id)
+      }
+      if (e.metaKey && e.key === 'e') {
+        e.preventDefault()
+        const id = useSessionStore.getState().activeTabId
+        useSessionStore.getState().toggleFileEditor(id)
+      }
+      if (e.metaKey && e.key === '2') {
+        e.preventDefault()
+        const id = useSessionStore.getState().activeTabId
+        useSessionStore.getState().toggleTerminal(id)
+      }
+      if (e.metaKey && e.key === '3') {
+        e.preventDefault()
+        useSessionStore.getState().toggleGitPanel()
+      }
+      if (e.metaKey && e.key === 'k') {
+        e.preventDefault()
+        const s = useSessionStore.getState()
+        if (!s.isExpanded) s.toggleExpanded()
+      }
+      if (e.metaKey && e.key === 'j') {
+        e.preventDefault()
+        const s = useSessionStore.getState()
+        if (s.isExpanded) s.toggleExpanded()
+      }
+      if (e.metaKey && e.key === 'h') {
+        e.preventDefault()
+        const { tabs, activeTabId, selectTab } = useSessionStore.getState()
+        const idx = tabs.findIndex((t) => t.id === activeTabId)
+        const prev = tabs[(idx - 1 + tabs.length) % tabs.length]
+        if (prev) selectTab(prev.id)
+      }
+      if (e.metaKey && e.key === 'l') {
+        e.preventDefault()
+        const { tabs, activeTabId, selectTab } = useSessionStore.getState()
+        const idx = tabs.findIndex((t) => t.id === activeTabId)
+        const next = tabs[(idx + 1) % tabs.length]
+        if (next) selectTab(next.id)
+      }
+      if (e.metaKey && e.key === 'w') {
+        e.preventDefault()
+        const { tabs, activeTabId } = useSessionStore.getState()
+        const tab = tabs.find((t) => t.id === activeTabId)
+        if (tab) {
+          setCloseConfirmTab({
+            id: tab.id,
+            title: tab.customTitle || tab.title || 'Untitled',
+            directory: tab.workingDirectory,
+          })
+        }
+      }
+      if (e.metaKey && e.key === 'n') {
+        e.preventDefault()
+        useSessionStore.getState().createTab()
+      }
+      if (e.metaKey && e.key === 'r') {
+        e.preventDefault()
+        window.dispatchEvent(new CustomEvent('clui:open-recent-dirs'))
+      }
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [])
+
   const isExpanded = useSessionStore((s) => s.isExpanded)
   const marketplaceOpen = useSessionStore((s) => s.marketplaceOpen)
   const gitPanelOpen = useSessionStore((s) => s.gitPanelOpen)
   const activeTabId = useSessionStore((s) => s.activeTabId)
   const activeTab = useSessionStore((s) => s.tabs.find((t) => t.id === s.activeTabId))
   const terminalOpen = useSessionStore((s) => s.terminalOpenTabIds.has(s.activeTabId))
+  const explorerOpen = useSessionStore((s) => s.fileExplorerOpenTabIds.has(s.activeTabId))
+  const editorOpen = useSessionStore((s) => s.fileEditorOpenTabIds.has(s.activeTabId))
+  const editorDirState = useSessionStore((s) => {
+    const tab = s.tabs.find((t) => t.id === s.activeTabId)
+    return tab ? s.fileEditorStates.get(tab.workingDirectory) : undefined
+  })
   const isRunning = activeTabStatus === 'running' || activeTabStatus === 'connecting'
+
+  // When editor is open for this tab but the current dir has no files
+  // (e.g. base directory changed), auto-create a scratch file so the editor stays visible
+  useEffect(() => {
+    if (!editorOpen || !activeTab) return
+    const dir = activeTab.workingDirectory
+    const dirState = useSessionStore.getState().fileEditorStates.get(dir)
+    if (!dirState || dirState.files.length === 0) {
+      useSessionStore.getState().createScratchFile(dir)
+    }
+  }, [editorOpen, activeTab?.workingDirectory])
 
   // Layout dimensions — expandedUI widens and heightens the panel
   const contentWidth = expandedUI ? 700 : spacing.contentWidth
@@ -188,6 +405,12 @@ export default function App() {
   const cardCollapsedWidth = expandedUI ? 670 : 430
   const cardCollapsedMargin = expandedUI ? 15 : 15
   const bodyMaxHeight = expandedUI ? 520 : 400
+
+  const handleMainUIMouseDown = useCallback(() => {
+    if (useSessionStore.getState().fileEditorFocused) {
+      useSessionStore.getState().blurFileEditor()
+    }
+  }, [])
 
   const handleScreenshot = useCallback(async () => {
     const result = await window.clui.takeScreenshot()
@@ -206,7 +429,7 @@ export default function App() {
       <div className="flex flex-col justify-end h-full" style={{ background: 'transparent' }}>
 
         {/* ─── 460px content column, centered. Circles overflow left. ─── */}
-        <div style={{ width: contentWidth, position: 'relative', margin: '0 auto', transition: 'width 0.26s cubic-bezier(0.4, 0, 0.1, 1)' }}>
+        <div onMouseDown={handleMainUIMouseDown} style={{ width: contentWidth, position: 'relative', margin: '0 auto', transition: 'width 0.26s cubic-bezier(0.4, 0, 0.1, 1)' }}>
 
           <AnimatePresence initial={false}>
             {marketplaceOpen && (
@@ -248,6 +471,18 @@ export default function App() {
               <SettingsDialog onClose={() => useSessionStore.getState().closeSettings()} />
             )}
           </AnimatePresence>
+
+          {closeConfirmTab && (
+            <CloseTabConfirmDialog
+              title={closeConfirmTab.title}
+              directory={closeConfirmTab.directory}
+              onConfirm={() => {
+                useSessionStore.getState().closeTab(closeConfirmTab.id)
+                setCloseConfirmTab(null)
+              }}
+              onCancel={() => setCloseConfirmTab(null)}
+            />
+          )}
 
           {/* ─── Terminal panel ─── */}
           <AnimatePresence initial={false}>
@@ -376,6 +611,28 @@ export default function App() {
               <InputBar />
             </div>
           </div>
+          {/* File explorer — anchored to left edge of content column */}
+          <AnimatePresence>
+            {explorerOpen && (
+              <motion.div
+                data-clui-ui
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                transition={TRANSITION}
+                style={{
+                  position: 'absolute',
+                  right: '100%',
+                  bottom: 60,
+                  marginRight: 8,
+                  width: 240,
+                  zIndex: 25,
+                }}
+              >
+                <FileExplorer />
+              </motion.div>
+            )}
+          </AnimatePresence>
           {/* Git side panel — anchored to right edge of content column */}
           <AnimatePresence>
             {gitPanelOpen && (
@@ -399,6 +656,11 @@ export default function App() {
             )}
           </AnimatePresence>
         </div>
+
+        {/* File editor floating panel */}
+        {editorOpen && editorDirState && editorDirState.files.length > 0 && activeTab && (
+          <FileEditor dir={activeTab.workingDirectory} tabId={activeTabId} />
+        )}
       </div>
     </PopoverLayerProvider>
   )

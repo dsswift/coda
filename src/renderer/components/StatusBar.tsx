@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Terminal, CaretDown, Check, FolderOpen, Plus, X, ShieldCheck, ListChecks, GitBranch, Code } from '@phosphor-icons/react'
+import { Terminal, CaretDown, Check, FolderOpen, Plus, X, ShieldCheck, ListChecks, GitBranch, Code, TreeStructure, NotePencil } from '@phosphor-icons/react'
 import { useSessionStore, AVAILABLE_MODELS, getModelDisplayLabel } from '../stores/sessionStore'
 import { usePopoverLayer } from './PopoverLayer'
 import { useColors, useThemeStore } from '../theme'
@@ -18,12 +18,15 @@ function ModelPicker() {
   const popoverLayer = usePopoverLayer()
   const colors = useColors()
 
+  const activeTabId = useSessionStore((s) => s.activeTabId)
   const [open, setOpen] = useState(false)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const [pos, setPos] = useState({ bottom: 0, left: 0 })
 
   const isBusy = tab?.status === 'running' || tab?.status === 'connecting'
+
+  useEffect(() => { setOpen(false) }, [activeTabId])
 
   const updatePos = useCallback(() => {
     if (!triggerRef.current) return
@@ -133,6 +136,7 @@ function PermissionModePicker() {
     (s) => s.tabs.find((t) => t.id === s.activeTabId)?.permissionMode ?? 'plan'
   )
   const setPermissionMode = useSessionStore((s) => s.setPermissionMode)
+  const activeTabId = useSessionStore((s) => s.activeTabId)
   const popoverLayer = usePopoverLayer()
   const colors = useColors()
 
@@ -140,6 +144,8 @@ function PermissionModePicker() {
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const [pos, setPos] = useState({ bottom: 0, left: 0 })
+
+  useEffect(() => { setOpen(false) }, [activeTabId])
 
   const updatePos = useCallback(() => {
     if (!triggerRef.current) return
@@ -282,6 +288,7 @@ function OpenWithPicker() {
   )
   const preferredOpenWith = useThemeStore((s) => s.preferredOpenWith)
   const setPreferredOpenWith = useThemeStore((s) => s.setPreferredOpenWith)
+  const activeTabId = useSessionStore((s) => s.activeTabId)
   const popoverLayer = usePopoverLayer()
   const colors = useColors()
 
@@ -289,6 +296,8 @@ function OpenWithPicker() {
   const containerRef = useRef<HTMLDivElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const [pos, setPos] = useState({ bottom: 0, right: 0 })
+
+  useEffect(() => { setOpen(false) }, [activeTabId])
 
   const updatePos = useCallback(() => {
     if (!containerRef.current) return
@@ -433,6 +442,11 @@ export function StatusBar() {
   const setBaseDirectory = useSessionStore((s) => s.setBaseDirectory)
   const gitPanelOpen = useSessionStore((s) => s.gitPanelOpen)
   const toggleGitPanel = useSessionStore((s) => s.toggleGitPanel)
+  const activeTabId = useSessionStore((s) => s.activeTabId)
+  const explorerOpen = useSessionStore((s) => s.fileExplorerOpenTabIds.has(s.activeTabId))
+  const toggleFileExplorer = useSessionStore((s) => s.toggleFileExplorer)
+  const editorOpen = useSessionStore((s) => s.fileEditorOpenTabIds.has(s.activeTabId))
+  const toggleFileEditor = useSessionStore((s) => s.toggleFileEditor)
   const popoverLayer = usePopoverLayer()
   const colors = useColors()
 
@@ -441,6 +455,9 @@ export function StatusBar() {
   const dirRef = useRef<HTMLButtonElement>(null)
   const dirPopRef = useRef<HTMLDivElement>(null)
   const [dirPos, setDirPos] = useState({ bottom: 0, left: 0 })
+
+  // Close popover on tab change
+  useEffect(() => { setDirOpen(false) }, [activeTabId])
 
   // Close popover on outside click
   useEffect(() => {
@@ -520,8 +537,27 @@ export function StatusBar() {
       className="flex items-center justify-between px-4 py-1.5"
       style={{ minHeight: 28 }}
     >
-      {/* Left — directory + model picker */}
+      {/* Left — explorer/editor toggles + directory + model picker */}
       <div className="flex items-center gap-2 text-[11px] min-w-0" style={{ color: colors.textTertiary }}>
+        {/* File explorer toggle */}
+        <button
+          onClick={() => toggleFileExplorer(activeTabId)}
+          className="flex items-center rounded-full px-1 py-0.5 transition-colors flex-shrink-0"
+          style={{ color: explorerOpen ? colors.accent : colors.textTertiary, cursor: 'pointer' }}
+          title={explorerOpen ? 'Close file explorer (⌘1)' : 'Open file explorer (⌘1)'}
+        >
+          <TreeStructure size={11} />
+        </button>
+        {/* File editor toggle */}
+        <button
+          onClick={() => toggleFileEditor(activeTabId)}
+          className="flex items-center rounded-full px-1 py-0.5 transition-colors flex-shrink-0"
+          style={{ color: editorOpen ? colors.accent : colors.textTertiary, cursor: 'pointer' }}
+          title={editorOpen ? 'Close file editor (⌘E)' : 'Open file editor (⌘E)'}
+        >
+          <NotePencil size={11} />
+        </button>
+        <span style={{ color: colors.textMuted, fontSize: 10 }}>|</span>
         {/* Directory button */}
         <button
           ref={dirRef}
@@ -555,7 +591,9 @@ export function StatusBar() {
               position: 'fixed',
               bottom: dirPos.bottom,
               left: dirPos.left,
-              width: 220,
+              width: 'auto',
+              minWidth: 220,
+              maxWidth: 500,
               pointerEvents: 'auto',
               background: colors.popoverBg,
               backdropFilter: 'blur(20px)',
@@ -569,14 +607,15 @@ export function StatusBar() {
               <button
                 onClick={handleChangeBaseDir}
                 disabled={isRunning || baseLocked}
-                className="w-full text-left px-2 py-1 rounded-lg transition-colors"
+                className="w-full text-left px-2 py-1 rounded-lg transition-colors hover:bg-white/5"
                 style={{ cursor: isRunning || baseLocked ? 'default' : 'pointer', opacity: baseLocked ? 0.7 : 1 }}
                 title={baseLocked ? 'Base directory is locked after the conversation starts' : tab.hasChosenDirectory ? `${tab.workingDirectory} — click to change` : 'Click to choose a base directory'}
               >
                 <div className="text-[9px] uppercase tracking-wider mb-1" style={{ color: colors.textTertiary }}>
                   Base directory
                 </div>
-                <div className="text-[11px] truncate" style={{ color: tab.hasChosenDirectory ? colors.textSecondary : colors.textMuted }}>
+                <div className="flex items-center gap-1.5 text-[11px]" style={{ color: tab.hasChosenDirectory ? colors.textSecondary : colors.textMuted, whiteSpace: 'nowrap' }}>
+                  <FolderOpen size={13} className="flex-shrink-0" style={{ color: colors.accent }} />
                   {tab.hasChosenDirectory ? tab.workingDirectory : 'None (defaults to ~)'}
                 </div>
               </button>
@@ -633,10 +672,12 @@ export function StatusBar() {
         <PermissionModePicker />
       </div>
 
-      {/* Right — Git + Open in CLI */}
+      {/* Right — Open in CLI + Git */}
       <div className="flex items-center gap-1.5 flex-shrink-0">
+        <OpenWithPicker />
         {isGitRepo && (
           <>
+            <span style={{ color: colors.textMuted, fontSize: 10 }}>|</span>
             <button
               onClick={toggleGitPanel}
               className="flex items-center gap-0.5 rounded-full px-1.5 py-0.5 transition-colors"
@@ -645,10 +686,8 @@ export function StatusBar() {
             >
               <GitBranch size={11} />
             </button>
-            <span style={{ color: colors.textMuted, fontSize: 10 }}>|</span>
           </>
         )}
-        <OpenWithPicker />
       </div>
     </div>
   )
