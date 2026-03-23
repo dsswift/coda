@@ -292,6 +292,7 @@ interface ThemeState {
   soundEnabled: boolean
   expandedUI: boolean
   defaultBaseDirectory: string
+  recentBaseDirectories: string[]
   showDirLabel: boolean
   preferredOpenWith: 'cli' | 'vscode'
   showImplementClearContext: boolean
@@ -304,6 +305,9 @@ interface ThemeState {
   expandToolResults: boolean
   terminalFontFamily: string
   terminalFontSize: number
+  closeExplorerOnFileOpen: boolean
+  openMarkdownInPreview: boolean
+  editorWordWrap: boolean
   /** OS-reported dark mode — used when themeMode is 'system' */
   _systemIsDark: boolean
   setIsDark: (isDark: boolean) => void
@@ -311,6 +315,7 @@ interface ThemeState {
   setSoundEnabled: (enabled: boolean) => void
   setExpandedUI: (expanded: boolean) => void
   setDefaultBaseDirectory: (dir: string) => void
+  addRecentBaseDirectory: (dir: string) => void
   setShowDirLabel: (show: boolean) => void
   setPreferredOpenWith: (app: 'cli' | 'vscode') => void
   setShowImplementClearContext: (show: boolean) => void
@@ -323,6 +328,9 @@ interface ThemeState {
   setExpandToolResults: (enabled: boolean) => void
   setTerminalFontFamily: (font: string) => void
   setTerminalFontSize: (size: number) => void
+  setCloseExplorerOnFileOpen: (enabled: boolean) => void
+  setOpenMarkdownInPreview: (enabled: boolean) => void
+  setEditorWordWrap: (enabled: boolean) => void
   /** Called by OS theme change listener — updates system value */
   setSystemTheme: (isDark: boolean) => void
 }
@@ -346,15 +354,15 @@ function applyTheme(isDark: boolean): void {
   syncTokensToCss(isDark ? darkColors : lightColors)
 }
 
-const SETTINGS_DEFAULTS = { themeMode: 'dark' as ThemeMode, soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', showDirLabel: false, preferredOpenWith: 'cli' as 'cli' | 'vscode', showImplementClearContext: false, defaultPermissionMode: 'plan' as 'ask' | 'auto' | 'plan', expandOnTabSwitch: true, bashCommandEntry: false, gitPanelSplitRatio: 0.4, gitPanelChangesOpen: true, gitPanelGraphOpen: true, expandToolResults: false, terminalFontFamily: 'Menlo, Monaco, monospace', terminalFontSize: 13 }
+const SETTINGS_DEFAULTS = { themeMode: 'dark' as ThemeMode, soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', recentBaseDirectories: [] as string[], showDirLabel: false, preferredOpenWith: 'cli' as 'cli' | 'vscode', showImplementClearContext: false, defaultPermissionMode: 'plan' as 'ask' | 'auto' | 'plan', expandOnTabSwitch: true, bashCommandEntry: false, gitPanelSplitRatio: 0.4, gitPanelChangesOpen: true, gitPanelGraphOpen: true, expandToolResults: false, terminalFontFamily: 'Menlo, Monaco, monospace', terminalFontSize: 13, closeExplorerOnFileOpen: true, openMarkdownInPreview: true, editorWordWrap: true }
 
-function saveSettings(s: { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string; showDirLabel: boolean; preferredOpenWith: string; showImplementClearContext: boolean; defaultPermissionMode: string; expandOnTabSwitch: boolean; bashCommandEntry: boolean; gitPanelSplitRatio: number; gitPanelChangesOpen: boolean; gitPanelGraphOpen: boolean; expandToolResults: boolean; terminalFontFamily: string; terminalFontSize: number }): void {
+function saveSettings(s: { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string; recentBaseDirectories: string[]; showDirLabel: boolean; preferredOpenWith: string; showImplementClearContext: boolean; defaultPermissionMode: string; expandOnTabSwitch: boolean; bashCommandEntry: boolean; gitPanelSplitRatio: number; gitPanelChangesOpen: boolean; gitPanelGraphOpen: boolean; expandToolResults: boolean; terminalFontFamily: string; terminalFontSize: number }): void {
   window.clui?.saveSettings(s)
 }
 
-function getAllSettings(get: () => ThemeState): { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string; showDirLabel: boolean; preferredOpenWith: string; showImplementClearContext: boolean; defaultPermissionMode: string; expandOnTabSwitch: boolean; bashCommandEntry: boolean; gitPanelSplitRatio: number; gitPanelChangesOpen: boolean; gitPanelGraphOpen: boolean; expandToolResults: boolean; terminalFontFamily: string; terminalFontSize: number } {
+function getAllSettings(get: () => ThemeState): { themeMode: string; soundEnabled: boolean; expandedUI: boolean; defaultBaseDirectory: string; recentBaseDirectories: string[]; showDirLabel: boolean; preferredOpenWith: string; showImplementClearContext: boolean; defaultPermissionMode: string; expandOnTabSwitch: boolean; bashCommandEntry: boolean; gitPanelSplitRatio: number; gitPanelChangesOpen: boolean; gitPanelGraphOpen: boolean; expandToolResults: boolean; terminalFontFamily: string; terminalFontSize: number } {
   const s = get()
-  return { themeMode: s.themeMode, soundEnabled: s.soundEnabled, expandedUI: s.expandedUI, defaultBaseDirectory: s.defaultBaseDirectory, showDirLabel: s.showDirLabel, preferredOpenWith: s.preferredOpenWith, showImplementClearContext: s.showImplementClearContext, defaultPermissionMode: s.defaultPermissionMode, expandOnTabSwitch: s.expandOnTabSwitch, bashCommandEntry: s.bashCommandEntry, gitPanelSplitRatio: s.gitPanelSplitRatio, gitPanelChangesOpen: s.gitPanelChangesOpen, gitPanelGraphOpen: s.gitPanelGraphOpen, expandToolResults: s.expandToolResults, terminalFontFamily: s.terminalFontFamily, terminalFontSize: s.terminalFontSize }
+  return { themeMode: s.themeMode, soundEnabled: s.soundEnabled, expandedUI: s.expandedUI, defaultBaseDirectory: s.defaultBaseDirectory, recentBaseDirectories: s.recentBaseDirectories, showDirLabel: s.showDirLabel, preferredOpenWith: s.preferredOpenWith, showImplementClearContext: s.showImplementClearContext, defaultPermissionMode: s.defaultPermissionMode, expandOnTabSwitch: s.expandOnTabSwitch, bashCommandEntry: s.bashCommandEntry, gitPanelSplitRatio: s.gitPanelSplitRatio, gitPanelChangesOpen: s.gitPanelChangesOpen, gitPanelGraphOpen: s.gitPanelGraphOpen, expandToolResults: s.expandToolResults, terminalFontFamily: s.terminalFontFamily, terminalFontSize: s.terminalFontSize }
 }
 
 // Start with defaults; async load from disk will update immediately after mount.
@@ -366,6 +374,7 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   soundEnabled: saved.soundEnabled,
   expandedUI: saved.expandedUI,
   defaultBaseDirectory: saved.defaultBaseDirectory,
+  recentBaseDirectories: saved.recentBaseDirectories,
   showDirLabel: saved.showDirLabel,
   preferredOpenWith: saved.preferredOpenWith,
   showImplementClearContext: saved.showImplementClearContext,
@@ -378,6 +387,9 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   expandToolResults: saved.expandToolResults,
   terminalFontFamily: saved.terminalFontFamily,
   terminalFontSize: saved.terminalFontSize,
+  closeExplorerOnFileOpen: saved.closeExplorerOnFileOpen,
+  openMarkdownInPreview: saved.openMarkdownInPreview,
+  editorWordWrap: saved.editorWordWrap,
   _systemIsDark: true,
   setIsDark: (isDark) => {
     set({ isDark })
@@ -399,6 +411,12 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   },
   setDefaultBaseDirectory: (dir) => {
     set({ defaultBaseDirectory: dir })
+    saveSettings(getAllSettings(get))
+  },
+  addRecentBaseDirectory: (dir) => {
+    const current = get().recentBaseDirectories.filter((d) => d !== dir)
+    const updated = [dir, ...current].slice(0, 8)
+    set({ recentBaseDirectories: updated })
     saveSettings(getAllSettings(get))
   },
   setShowDirLabel: (show) => {
@@ -449,6 +467,18 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
     set({ terminalFontSize: size })
     saveSettings(getAllSettings(get))
   },
+  setCloseExplorerOnFileOpen: (enabled) => {
+    set({ closeExplorerOnFileOpen: enabled })
+    saveSettings(getAllSettings(get))
+  },
+  setOpenMarkdownInPreview: (enabled) => {
+    set({ openMarkdownInPreview: enabled })
+    saveSettings(getAllSettings(get))
+  },
+  setEditorWordWrap: (enabled) => {
+    set({ editorWordWrap: enabled })
+    saveSettings(getAllSettings(get))
+  },
   setSystemTheme: (isDark) => {
     set({ _systemIsDark: isDark })
     // Only apply if following system
@@ -471,7 +501,8 @@ window.clui?.loadSettings().then((disk) => {
   const sound = typeof disk.soundEnabled === 'boolean' ? disk.soundEnabled : true
   const expanded = typeof disk.expandedUI === 'boolean' ? disk.expandedUI : false
   const baseDir = typeof disk.defaultBaseDirectory === 'string' ? disk.defaultBaseDirectory : ''
-  const dirLabel = typeof disk.showDirLabel === 'boolean' ? disk.showDirLabel : false
+  const recentDirs = Array.isArray(disk.recentBaseDirectories) ? disk.recentBaseDirectories.filter((d: unknown) => typeof d === 'string').slice(0, 8) : []
+  const dirLabel = typeof disk.showDirLabel === 'boolean' ? disk.showDirLabel : true
   const openWith = (disk.preferredOpenWith === 'cli' || disk.preferredOpenWith === 'vscode') ? disk.preferredOpenWith : 'cli'
   const implClearCtx = typeof disk.showImplementClearContext === 'boolean' ? disk.showImplementClearContext : false
   const expandTabSwitch = typeof disk.expandOnTabSwitch === 'boolean' ? disk.expandOnTabSwitch : true
@@ -482,7 +513,10 @@ window.clui?.loadSettings().then((disk) => {
   const expandTools = typeof disk.expandToolResults === 'boolean' ? disk.expandToolResults : false
   const termFont = typeof disk.terminalFontFamily === 'string' ? disk.terminalFontFamily : 'Menlo, Monaco, monospace'
   const termSize = typeof disk.terminalFontSize === 'number' ? disk.terminalFontSize : 13
-  useThemeStore.setState({ themeMode: mode, isDark: resolved, soundEnabled: sound, expandedUI: expanded, defaultBaseDirectory: baseDir, showDirLabel: dirLabel, preferredOpenWith: openWith, showImplementClearContext: implClearCtx, expandOnTabSwitch: expandTabSwitch, bashCommandEntry: bashCmd, gitPanelSplitRatio: splitRatio, gitPanelChangesOpen: changesOpen, gitPanelGraphOpen: graphOpen, expandToolResults: expandTools, terminalFontFamily: termFont, terminalFontSize: termSize })
+  const closeExplorer = typeof disk.closeExplorerOnFileOpen === 'boolean' ? disk.closeExplorerOnFileOpen : true
+  const mdPreview = typeof disk.openMarkdownInPreview === 'boolean' ? disk.openMarkdownInPreview : true
+  const wordWrap = typeof disk.editorWordWrap === 'boolean' ? disk.editorWordWrap : true
+  useThemeStore.setState({ themeMode: mode, isDark: resolved, soundEnabled: sound, expandedUI: expanded, defaultBaseDirectory: baseDir, recentBaseDirectories: recentDirs, showDirLabel: dirLabel, preferredOpenWith: openWith, showImplementClearContext: implClearCtx, expandOnTabSwitch: expandTabSwitch, bashCommandEntry: bashCmd, gitPanelSplitRatio: splitRatio, gitPanelChangesOpen: changesOpen, gitPanelGraphOpen: graphOpen, expandToolResults: expandTools, terminalFontFamily: termFont, terminalFontSize: termSize, closeExplorerOnFileOpen: closeExplorer, openMarkdownInPreview: mdPreview, editorWordWrap: wordWrap })
   applyTheme(resolved)
 })
 

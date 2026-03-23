@@ -743,9 +743,11 @@ function relativeDate(iso: string): string {
 function GitGraphSection({
   directory,
   onRefresh,
+  refreshKey,
 }: {
   directory: string
   onRefresh: () => void
+  refreshKey: number
 }) {
   const colors = useColors()
   const [commits, setCommits] = useState<GitCommit[]>([])
@@ -780,6 +782,13 @@ function GitGraphSection({
     loadGraph()
     window.clui.gitChanges(directory).then((r) => setBranch(r.branch)).catch(() => {})
   }, [directory, loadGraph])
+
+  // Reload graph when parent triggers a refresh (e.g. after commit)
+  const initialRef = useRef(true)
+  useEffect(() => {
+    if (initialRef.current) { initialRef.current = false; return }
+    loadGraph()
+  }, [refreshKey, loadGraph])
 
   // Infinite scroll
   useEffect(() => {
@@ -1052,7 +1061,17 @@ export function GitPanel() {
           flexShrink: 0,
         }}
       >
-        <span className="text-[10px] font-medium" style={{ color: colors.textTertiary }}>Git</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <button
+            onClick={() => useSessionStore.getState().closeGitPanel()}
+            className="flex items-center justify-center rounded transition-colors"
+            style={{ color: colors.textTertiary, cursor: 'pointer', padding: 1 }}
+            title="Close git panel"
+          >
+            <X size={11} />
+          </button>
+          <span className="text-[10px] font-medium" style={{ color: colors.textTertiary }}>Git</span>
+        </div>
         <button
           onClick={refresh}
           className="p-0.5 rounded transition-colors"
@@ -1155,7 +1174,7 @@ export function GitPanel() {
         </button>
         {graphOpen && (
           <div style={{ height: graphContentHeight, minHeight: 0, overflow: 'hidden' }}>
-            <GitGraphSection directory={directory} onRefresh={refresh} />
+            <GitGraphSection directory={directory} onRefresh={refresh} refreshKey={refreshKey} />
           </div>
         )}
       </div>

@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence, Reorder, useDragControls } from 'framer-motion'
-import { Plus, X, Prohibit, Terminal } from '@phosphor-icons/react'
+import { Plus, X, Prohibit, Terminal, FolderPlus, FolderOpen } from '@phosphor-icons/react'
 import { useSessionStore } from '../stores/sessionStore'
 import { HistoryPicker } from './HistoryPicker'
 import { SettingsPopover } from './SettingsPopover'
@@ -132,6 +132,171 @@ function PillColorPicker({
   )
 }
 
+function DirContextMenu({
+  anchor,
+  dirName,
+  onCreateTab,
+  onClose,
+}: {
+  anchor: { x: number; y: number }
+  dirName: string
+  onCreateTab: () => void
+  onClose: () => void
+}) {
+  const colors = useColors()
+  const popoverLayer = usePopoverLayer()
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose()
+    }
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('mousedown', handleClick)
+    window.addEventListener('keydown', handleKey)
+    return () => {
+      window.removeEventListener('mousedown', handleClick)
+      window.removeEventListener('keydown', handleKey)
+    }
+  }, [onClose])
+
+  if (!popoverLayer) return null
+
+  return createPortal(
+    <motion.div
+      ref={ref}
+      data-clui-ui
+      initial={{ opacity: 0, scale: 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.9 }}
+      transition={{ duration: 0.12 }}
+      style={{
+        position: 'fixed',
+        left: anchor.x,
+        top: anchor.y + 8,
+        pointerEvents: 'auto',
+        background: colors.popoverBg,
+        border: `1px solid ${colors.popoverBorder}`,
+        borderRadius: 8,
+        padding: 4,
+        zIndex: 10000,
+        minWidth: 140,
+      }}
+    >
+      <button
+        onClick={() => { onCreateTab(); onClose() }}
+        className="flex items-center gap-2 w-full rounded px-2 py-1.5 text-left"
+        style={{
+          fontSize: 12,
+          color: colors.textPrimary,
+          background: 'transparent',
+          border: 'none',
+          cursor: 'pointer',
+        }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = colors.tabActive }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+      >
+        <FolderPlus size={14} color={colors.textSecondary} />
+        <span>New tab in {dirName}</span>
+      </button>
+    </motion.div>,
+    popoverLayer,
+  )
+}
+
+function RecentDirsContextMenu({
+  anchor,
+  onSelectDir,
+  onClose,
+}: {
+  anchor: { x: number; y: number }
+  onSelectDir: (dir: string) => void
+  onClose: () => void
+}) {
+  const colors = useColors()
+  const popoverLayer = usePopoverLayer()
+  const ref = useRef<HTMLDivElement>(null)
+  const recentDirs = useThemeStore((s) => s.recentBaseDirectories)
+
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose()
+    }
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('mousedown', handleClick)
+    window.addEventListener('keydown', handleKey)
+    return () => {
+      window.removeEventListener('mousedown', handleClick)
+      window.removeEventListener('keydown', handleKey)
+    }
+  }, [onClose])
+
+  if (!popoverLayer) return null
+
+  return createPortal(
+    <motion.div
+      ref={ref}
+      data-clui-ui
+      initial={{ opacity: 0, scale: 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.9 }}
+      transition={{ duration: 0.12 }}
+      style={{
+        position: 'fixed',
+        left: anchor.x,
+        top: anchor.y + 8,
+        pointerEvents: 'auto',
+        background: colors.popoverBg,
+        border: `1px solid ${colors.popoverBorder}`,
+        borderRadius: 8,
+        padding: 4,
+        zIndex: 10000,
+        minWidth: 180,
+        maxWidth: 320,
+      }}
+    >
+      {recentDirs.length === 0 ? (
+        <div
+          className="flex items-center gap-2 w-full px-2 py-1.5"
+          style={{ fontSize: 12, color: colors.textTertiary }}
+        >
+          No recent directories
+        </div>
+      ) : (
+        recentDirs.map((dir) => {
+          const homePath = useSessionStore.getState().staticInfo?.homePath || ''
+          const displayPath = homePath && dir.startsWith(homePath) ? '~' + dir.slice(homePath.length) : dir
+          return (
+            <button
+              key={dir}
+              onClick={() => { onSelectDir(dir); onClose() }}
+              className="flex items-center gap-2 w-full rounded px-2 py-1.5 text-left"
+              style={{
+                fontSize: 12,
+                color: colors.textPrimary,
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+              }}
+              title={dir}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = colors.tabActive }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+            >
+              <FolderOpen size={14} color={colors.textSecondary} style={{ flexShrink: 0 }} />
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayPath}</span>
+            </button>
+          )
+        })
+      )}
+    </motion.div>,
+    popoverLayer,
+  )
+}
+
 function InlineRenameInput({
   value,
   onCommit,
@@ -236,6 +401,9 @@ function TabPill({
   colorPickerTabId,
   onOpenColorPicker,
   onCloseColorPicker,
+  onOpenDirMenu,
+  onCreateTabInDir,
+  dirMenuTabId,
   tabRefs,
 }: {
   tab: TabState
@@ -254,6 +422,9 @@ function TabPill({
   colorPickerTabId: string | null
   onOpenColorPicker: (tabId: string, anchor: { x: number; y: number }) => void
   onCloseColorPicker: () => void
+  onOpenDirMenu: (tabId: string, anchor: { x: number; y: number }) => void
+  onCreateTabInDir: (dir: string) => void
+  dirMenuTabId: string | null
   tabRefs: React.MutableRefObject<Map<string, HTMLDivElement>>
 }) {
   const colors = useColors()
@@ -338,6 +509,12 @@ function TabPill({
             fontWeight: 500,
             color: colors.textSecondary,
             opacity: 0.5,
+            cursor: 'default',
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            onOpenDirMenu(tab.id, { x: e.clientX, y: e.clientY })
           }}
         >
           {tab.workingDirectory.split('/').pop() || tab.workingDirectory}
@@ -410,6 +587,7 @@ export function TabStrip() {
   const reorderTabs = useSessionStore((s) => s.reorderTabs)
   const renameTab = useSessionStore((s) => s.renameTab)
   const setTabPillColor = useSessionStore((s) => s.setTabPillColor)
+  const createTabInDirectory = useSessionStore((s) => s.createTabInDirectory)
   const toggleTerminal = useSessionStore((s) => s.toggleTerminal)
   const terminalOpenTabIds = useSessionStore((s) => s.terminalOpenTabIds)
   const colors = useColors()
@@ -420,6 +598,10 @@ export function TabStrip() {
   const [confirmingCloseId, setConfirmingCloseId] = useState<string | null>(null)
   const [colorPickerTabId, setColorPickerTabId] = useState<string | null>(null)
   const [colorPickerAnchor, setColorPickerAnchor] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
+  const [dirMenuTabId, setDirMenuTabId] = useState<string | null>(null)
+  const [dirMenuAnchor, setDirMenuAnchor] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
+  const [recentDirsMenu, setRecentDirsMenu] = useState<{ x: number; y: number } | null>(null)
+  const plusButtonRef = useRef<HTMLButtonElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const tabRefs = useRef<Map<string, HTMLDivElement>>(new Map())
 
@@ -431,6 +613,17 @@ export function TabStrip() {
       el?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' })
     })
   }, [confirmingCloseId])
+
+  // Listen for CMD+R "open recent dirs" event from App
+  useEffect(() => {
+    const handler = () => {
+      if (!plusButtonRef.current) return
+      const rect = plusButtonRef.current.getBoundingClientRect()
+      setRecentDirsMenu({ x: rect.left, y: rect.bottom })
+    }
+    window.addEventListener('clui:open-recent-dirs', handler)
+    return () => window.removeEventListener('clui:open-recent-dirs', handler)
+  }, [])
 
   // Convert vertical wheel to horizontal scroll
   const onWheel = useCallback((e: React.WheelEvent) => {
@@ -490,6 +683,9 @@ export function TabStrip() {
                 colorPickerTabId={colorPickerTabId}
                 onOpenColorPicker={(tabId, anchor) => { setColorPickerTabId(tabId); setColorPickerAnchor(anchor) }}
                 onCloseColorPicker={() => setColorPickerTabId(null)}
+                onOpenDirMenu={(tabId, anchor) => { setDirMenuTabId(tabId); setDirMenuAnchor(anchor) }}
+                onCreateTabInDir={(dir) => createTabInDirectory(dir)}
+                dirMenuTabId={dirMenuTabId}
                 tabRefs={tabRefs}
               />
             ))}
@@ -513,13 +709,43 @@ export function TabStrip() {
         })()}
       </AnimatePresence>
 
+      <AnimatePresence>
+        {dirMenuTabId && (() => {
+          const menuTab = tabs.find((t) => t.id === dirMenuTabId)
+          if (!menuTab?.workingDirectory) return null
+          const dirName = menuTab.workingDirectory.split('/').pop() || menuTab.workingDirectory
+          return (
+            <DirContextMenu
+              key="dir-context-menu"
+              anchor={dirMenuAnchor}
+              dirName={dirName}
+              onCreateTab={() => createTabInDirectory(menuTab.workingDirectory)}
+              onClose={() => setDirMenuTabId(null)}
+            />
+          )
+        })()}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {recentDirsMenu && (
+          <RecentDirsContextMenu
+            key="recent-dirs-menu"
+            anchor={recentDirsMenu}
+            onSelectDir={(dir) => createTabInDirectory(dir)}
+            onClose={() => setRecentDirsMenu(null)}
+          />
+        )}
+      </AnimatePresence>
+
       {/* Pinned action buttons — always visible on the right */}
       <div className="flex items-center gap-0.5 flex-shrink-0 ml-1 pr-2">
         <button
+          ref={plusButtonRef}
           onClick={() => createTab()}
+          onContextMenu={(e) => { e.preventDefault(); setRecentDirsMenu({ x: e.clientX, y: e.clientY }) }}
           className="flex-shrink-0 w-6 h-6 flex items-center justify-center rounded-full transition-colors"
           style={{ color: colors.textTertiary }}
-          title="New tab"
+          title="New tab (right-click for recent dirs)"
         >
           <Plus size={14} />
         </button>
