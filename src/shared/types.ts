@@ -129,7 +129,7 @@ export interface PermissionRequest {
   options: Array<{ optionId: string; kind?: string; label: string }>
 }
 
-export interface Attachment {
+export interface FileAttachment {
   id: string
   type: 'image' | 'file'
   name: string
@@ -141,6 +141,15 @@ export interface Attachment {
   size?: number
 }
 
+export interface PlanAttachment {
+  id: string
+  type: 'plan'
+  name: string
+  path: string
+}
+
+export type Attachment = FileAttachment | PlanAttachment
+
 export interface TabState {
   id: string
   claudeSessionId: string | null
@@ -151,7 +160,9 @@ export interface TabState {
   permissionQueue: PermissionRequest[]
   /** Fallback card when tools were denied and no interactive permission is available */
   permissionDenied: { tools: Array<{ toolName: string; toolUseId: string }> } | null
-  attachments: Attachment[]
+  attachments: FileAttachment[]
+  /** Draft input text for this tab's input bar (scoped per-tab) */
+  draftInput: string
   messages: Message[]
   title: string
   /** User-provided custom tab name (overrides auto-generated title when set) */
@@ -182,6 +193,10 @@ export interface TabState {
   bashExecId: string | null
   /** Custom pill outline color (null = use theme default) */
   pillColor: string | null
+  /** Worktree metadata when tab operates inside a managed worktree */
+  worktree: WorktreeInfo | null
+  /** True while waiting for the user to pick a source branch in the BranchPickerDialog */
+  pendingWorktreeSetup: boolean
 }
 
 export interface Message {
@@ -196,6 +211,8 @@ export interface Message {
   userExecuted?: boolean
   /** True when the expand-tool-results setting auto-expanded this result */
   autoExpandResult?: boolean
+  /** File or plan attachments associated with this message */
+  attachments?: Attachment[]
   timestamp: number
 }
 
@@ -284,6 +301,7 @@ export interface SessionMeta {
   sessionId: string
   slug: string | null
   firstMessage: string | null
+  lastResponse: string | null
   lastTimestamp: string
   size: number
 }
@@ -295,6 +313,7 @@ export interface SessionLoadMessage {
   toolId?: string
   toolInput?: string
   userExecuted?: boolean
+  attachments?: Attachment[]
   timestamp: number
 }
 
@@ -411,6 +430,16 @@ export const IPC = {
   GIT_UNSTAGE: 'coda:git-unstage',
   GIT_DISCARD: 'coda:git-discard',
   GIT_DELETE_BRANCH: 'coda:git-delete-branch',
+  GIT_COMMIT_DETAIL: 'coda:git-commit-detail',
+
+  // Git worktree operations
+  GIT_WORKTREE_ADD: 'coda:git-worktree-add',
+  GIT_WORKTREE_REMOVE: 'coda:git-worktree-remove',
+  GIT_WORKTREE_LIST: 'coda:git-worktree-list',
+  GIT_WORKTREE_STATUS: 'coda:git-worktree-status',
+  GIT_WORKTREE_MERGE: 'coda:git-worktree-merge',
+  GIT_WORKTREE_PUSH: 'coda:git-worktree-push',
+  GIT_WORKTREE_REBASE: 'coda:git-worktree-rebase',
 
   // Filesystem operations
   FS_READ_DIR: 'coda:fs-read-dir',
@@ -457,6 +486,7 @@ export interface PersistedTab {
   permissionMode: 'ask' | 'auto' | 'plan'
   bashResults?: Array<{ command: string; stdout: string; stderr: string }>
   pillColor?: string | null
+  worktree?: WorktreeInfo | null
 }
 
 export interface PersistedEditorFile {
@@ -488,6 +518,8 @@ export interface PersistedTabState {
   editorOpenSessionIds?: number[]
   /** Global file editor window position and size */
   editorGeometry?: { x: number; y: number; w: number; h: number }
+  /** Global plan preview window position and size */
+  planGeometry?: { x: number; y: number; w: number; h: number }
 }
 
 // ─── Git Types ───
@@ -506,6 +538,12 @@ export interface GitRef {
   name: string
   type: 'head' | 'remote' | 'tag'
   isCurrent: boolean
+}
+
+export interface GitCommitDetail {
+  filesChanged: number
+  insertions: number
+  deletions: number
 }
 
 export interface GitGraphData {
@@ -532,6 +570,30 @@ export interface GitBranchInfo {
   isCurrent: boolean
   upstream: string | null
   isRemote: boolean
+}
+
+// ─── Worktree Types ───
+
+export type GitOpsMode = 'manual' | 'worktree'
+export type WorktreeCompletionStrategy = 'merge' | 'pr'
+
+export interface WorktreeInfo {
+  /** Physical path on disk (~/.coda/worktrees/...) */
+  worktreePath: string
+  /** Auto-generated branch name (wt/<nanoid>) */
+  branchName: string
+  /** Branch the worktree was created from */
+  sourceBranch: string
+  /** Original repo root path */
+  repoPath: string
+}
+
+export interface WorktreeStatus {
+  hasUncommittedChanges: boolean
+  hasUnpushedCommits: boolean
+  isMerged: boolean
+  aheadCount: number
+  behindCount: number
 }
 
 // ─── Filesystem Types ───

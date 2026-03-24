@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, CatalogPlugin, PluginStatus, PersistedTabState } from '../../shared/types'
+import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, FileAttachment, CatalogPlugin, PluginStatus, PersistedTabState } from '../../shared/types'
 import { useThemeStore } from '../theme'
 import { destroyTerminalInstance } from '../components/TerminalPanel'
 import notificationSrc from '../../../resources/notification.mp3'
@@ -83,6 +83,8 @@ interface State {
   fileEditorStates: Map<string, FileEditorDirState>
   /** Global file editor window position and size (persisted across restarts) */
   editorGeometry: { x: number; y: number; w: number; h: number }
+  /** Global plan preview window position and size (persisted across restarts) */
+  planGeometry: { x: number; y: number; w: number; h: number }
   /** Whether tab restoration has completed (prevents placeholder flash) */
   tabsReady: boolean
 
@@ -103,8 +105,8 @@ interface State {
   initStaticInfo: () => Promise<void>
   setPreferredModel: (model: string | null) => void
   setPermissionMode: (mode: 'ask' | 'auto' | 'plan') => void
-  createTab: () => Promise<string>
-  createTabInDirectory: (dir: string) => Promise<string>
+  createTab: (useWorktree?: boolean) => Promise<string>
+  createTabInDirectory: (dir: string, useWorktree?: boolean) => Promise<string>
   selectTab: (tabId: string) => void
   closeTab: (tabId: string) => void
   reorderTabs: (reorderedTabs: TabState[]) => void
@@ -136,6 +138,7 @@ interface State {
   toggleEditorPreview: (dir: string, fileId: string) => void
   toggleEditorReadOnly: (dir: string, fileId: string) => void
   setEditorGeometry: (geo: { x: number; y: number; w: number; h: number }) => void
+  setPlanGeometry: (geo: { x: number; y: number; w: number; h: number }) => void
   loadMarketplace: (forceRefresh?: boolean) => Promise<void>
   setMarketplaceSearch: (query: string) => void
   setMarketplaceFilter: (filter: string) => void
@@ -146,14 +149,18 @@ interface State {
   addSystemMessage: (content: string) => void
   startBashCommand: (command: string, execId: string) => { toolMsgId: string; tabId: string }
   completeBashCommand: (tabId: string, toolMsgId: string, command: string, stdout: string, stderr: string, exitCode: number | null) => void
-  sendMessage: (prompt: string, projectPath?: string) => void
+  sendMessage: (prompt: string, projectPath?: string, extraAttachments?: Attachment[]) => void
   respondPermission: (tabId: string, questionId: string, optionId: string) => void
   addDirectory: (dir: string) => void
   removeDirectory: (dir: string) => void
   setBaseDirectory: (dir: string) => void
-  addAttachments: (attachments: Attachment[]) => void
+  setupWorktree: (tabId: string, sourceBranch: string, setAsDefault: boolean) => Promise<void>
+  cancelWorktreeSetup: (tabId: string) => void
+  finishWorktreeTab: (tabId: string, strategyOverride?: 'merge' | 'pr') => Promise<void>
+  addAttachments: (attachments: FileAttachment[]) => void
   removeAttachment: (attachmentId: string) => void
   clearAttachments: () => void
+  setDraftInput: (tabId: string, text: string) => void
   handleNormalizedEvent: (tabId: string, event: NormalizedEvent) => void
   handleStatusChange: (tabId: string, newStatus: string, oldStatus: string) => void
   handleError: (tabId: string, error: EnrichedError) => void
@@ -188,6 +195,7 @@ function makeLocalTab(): TabState {
     permissionQueue: [],
     permissionDenied: null,
     attachments: [],
+    draftInput: '',
     messages: [],
     title: 'New Tab',
     customTitle: null,
@@ -206,6 +214,8 @@ function makeLocalTab(): TabState {
     bashExecuting: false,
     bashExecId: null,
     pillColor: null,
+    worktree: null,
+    pendingWorktreeSetup: false,
   }
 }
 
@@ -225,6 +235,7 @@ export const useSessionStore = create<State>((set, get) => ({
   fileEditorFocused: true,
   fileEditorStates: new Map(),
   editorGeometry: { x: 60, y: 80, w: 680, h: 480 },
+  planGeometry: { x: 60, y: 80, w: 720, h: 420 },
   tabsReady: false,
 
   // Settings dialog
@@ -269,61 +280,103 @@ export const useSessionStore = create<State>((set, get) => ({
     window.coda.setPermissionMode(activeTabId, mode)
   },
 
-  createTab: async () => {
+  createTab: async (useWorktree) => {
     const homeDir = get().staticInfo?.homePath || '~'
     const defaultBase = useThemeStore.getState().defaultBaseDirectory
     const startDir = defaultBase || homeDir
     const hasChosen = !!defaultBase
+    const { activeTabId: prevTabId, tabs: prevTabs, fileEditorOpenTabIds: prevEditorOpen } = get()
+    const prevTab = prevTabs.find((t) => t.id === prevTabId)
+    const inheritEditor = prevTab && prevEditorOpen.has(prevTab.id) && prevTab.workingDirectory === startDir
+
+    let tabId: string
     try {
-      const { tabId } = await window.coda.createTab()
-      const tab: TabState = {
-        ...makeLocalTab(),
-        id: tabId,
-        workingDirectory: startDir,
-        hasChosenDirectory: hasChosen,
-      }
-      set((s) => ({
-        tabs: [...s.tabs, tab],
-        activeTabId: tab.id,
-      }))
-      return tabId
+      const res = await window.coda.createTab()
+      tabId = res.tabId
     } catch {
-      const tab = makeLocalTab()
-      tab.workingDirectory = startDir
-      tab.hasChosenDirectory = hasChosen
-      set((s) => ({
-        tabs: [...s.tabs, tab],
-        activeTabId: tab.id,
-      }))
-      return tab.id
+      tabId = crypto.randomUUID()
     }
+
+    const tab: TabState = {
+      ...makeLocalTab(),
+      id: tabId,
+      workingDirectory: startDir,
+      hasChosenDirectory: hasChosen,
+    }
+
+    // If worktree mode requested, check if directory is a git repo
+    if (useWorktree) {
+      const { isRepo } = await window.coda.gitIsRepo(startDir)
+      if (isRepo) {
+        const defaults = useThemeStore.getState().worktreeBranchDefaults
+        const defaultBranch = defaults[startDir]
+        if (defaultBranch) {
+          // Auto-create worktree with saved default
+          const result = await window.coda.gitWorktreeAdd(startDir, defaultBranch)
+          if (result.ok && result.worktree) {
+            tab.worktree = result.worktree
+            tab.workingDirectory = result.worktree.worktreePath
+          }
+        } else {
+          // Need user to pick a branch
+          tab.pendingWorktreeSetup = true
+        }
+      }
+    }
+
+    set((s) => ({
+      tabs: [...s.tabs, tab],
+      activeTabId: tab.id,
+      ...(inheritEditor ? { fileEditorOpenTabIds: new Set([...s.fileEditorOpenTabIds, tab.id]) } : {}),
+    }))
+    return tabId
   },
 
-  createTabInDirectory: async (dir) => {
+  createTabInDirectory: async (dir, useWorktree) => {
     useThemeStore.getState().addRecentBaseDirectory(dir)
+    const { activeTabId: prevTabId, tabs: prevTabs, fileEditorOpenTabIds: prevEditorOpen } = get()
+    const prevTab = prevTabs.find((t) => t.id === prevTabId)
+    const inheritEditor = prevTab && prevEditorOpen.has(prevTab.id) && prevTab.workingDirectory === dir
+
+    let tabId: string
     try {
-      const { tabId } = await window.coda.createTab()
-      const tab: TabState = {
-        ...makeLocalTab(),
-        id: tabId,
-        workingDirectory: dir,
-        hasChosenDirectory: true,
-      }
-      set((s) => ({
-        tabs: [...s.tabs, tab],
-        activeTabId: tab.id,
-      }))
-      return tabId
+      const res = await window.coda.createTab()
+      tabId = res.tabId
     } catch {
-      const tab = makeLocalTab()
-      tab.workingDirectory = dir
-      tab.hasChosenDirectory = true
-      set((s) => ({
-        tabs: [...s.tabs, tab],
-        activeTabId: tab.id,
-      }))
-      return tab.id
+      tabId = crypto.randomUUID()
     }
+
+    const tab: TabState = {
+      ...makeLocalTab(),
+      id: tabId,
+      workingDirectory: dir,
+      hasChosenDirectory: true,
+    }
+
+    // If worktree mode requested, check if directory is a git repo
+    if (useWorktree) {
+      const { isRepo } = await window.coda.gitIsRepo(dir)
+      if (isRepo) {
+        const defaults = useThemeStore.getState().worktreeBranchDefaults
+        const defaultBranch = defaults[dir]
+        if (defaultBranch) {
+          const result = await window.coda.gitWorktreeAdd(dir, defaultBranch)
+          if (result.ok && result.worktree) {
+            tab.worktree = result.worktree
+            tab.workingDirectory = result.worktree.worktreePath
+          }
+        } else {
+          tab.pendingWorktreeSetup = true
+        }
+      }
+    }
+
+    set((s) => ({
+      tabs: [...s.tabs, tab],
+      activeTabId: tab.id,
+      ...(inheritEditor ? { fileEditorOpenTabIds: new Set([...s.fileEditorOpenTabIds, tab.id]) } : {}),
+    }))
+    return tabId
   },
 
   selectTab: (tabId) => {
@@ -659,6 +712,7 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   setEditorGeometry: (geo) => set({ editorGeometry: geo }),
+  setPlanGeometry: (geo) => set({ planGeometry: geo }),
 
   loadMarketplace: async (forceRefresh) => {
     set({ marketplaceLoading: true, marketplaceError: null })
@@ -740,6 +794,16 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   closeTab: (tabId) => {
+    // Clean up worktree if this tab has one
+    const closingTab = get().tabs.find((t) => t.id === tabId)
+    if (closingTab?.worktree) {
+      window.coda.gitWorktreeRemove(
+        closingTab.worktree.repoPath,
+        closingTab.worktree.worktreePath,
+        closingTab.worktree.branchName,
+        true, // force
+      ).catch(() => {})
+    }
     window.coda.closeTab(tabId).catch(() => {})
     window.coda.terminalDestroy(tabId).catch(() => {})
     destroyTerminalInstance(tabId)
@@ -833,6 +897,7 @@ export const useSessionStore = create<State>((set, get) => ({
         toolInput: m.toolInput,
         toolStatus: m.toolName ? 'completed' as const : undefined,
         userExecuted: m.userExecuted,
+        attachments: m.attachments,
         timestamp: m.timestamp,
       }))
 
@@ -998,6 +1063,18 @@ export const useSessionStore = create<State>((set, get) => ({
   setBaseDirectory: (dir) => {
     useThemeStore.getState().addRecentBaseDirectory(dir)
     const { activeTabId } = get()
+    const tab = get().tabs.find((t) => t.id === activeTabId)
+
+    // If tab has a worktree and no messages yet, clean it up before switching
+    if (tab?.worktree && tab.messages.length === 0) {
+      window.coda.gitWorktreeRemove(
+        tab.worktree.repoPath,
+        tab.worktree.worktreePath,
+        tab.worktree.branchName,
+        true,
+      ).catch(() => {})
+    }
+
     window.coda.resetTabSession(activeTabId)
     set((s) => ({
       tabs: s.tabs.map((t) =>
@@ -1008,10 +1085,128 @@ export const useSessionStore = create<State>((set, get) => ({
               hasChosenDirectory: true,
               claudeSessionId: null,
               additionalDirs: [],
+              worktree: null,
+              pendingWorktreeSetup: false,
             }
           : t
       ),
     }))
+
+    // If in worktree mode, re-setup for new directory
+    const gitOpsMode = useThemeStore.getState().gitOpsMode
+    if (gitOpsMode === 'worktree') {
+      window.coda.gitIsRepo(dir).then(({ isRepo }) => {
+        if (!isRepo) return
+        const defaults = useThemeStore.getState().worktreeBranchDefaults
+        const defaultBranch = defaults[dir]
+        if (defaultBranch) {
+          window.coda.gitWorktreeAdd(dir, defaultBranch).then((result) => {
+            if (result.ok && result.worktree) {
+              set((s) => ({
+                tabs: s.tabs.map((t) =>
+                  t.id === activeTabId
+                    ? { ...t, worktree: result.worktree!, workingDirectory: result.worktree!.worktreePath }
+                    : t
+                ),
+              }))
+            }
+          })
+        } else {
+          set((s) => ({
+            tabs: s.tabs.map((t) =>
+              t.id === activeTabId ? { ...t, pendingWorktreeSetup: true } : t
+            ),
+          }))
+        }
+      })
+    }
+  },
+
+  setupWorktree: async (tabId, sourceBranch, setAsDefault) => {
+    const tab = get().tabs.find((t) => t.id === tabId)
+    if (!tab) return
+    const repoPath = tab.workingDirectory
+
+    if (setAsDefault) {
+      useThemeStore.getState().setWorktreeBranchDefault(repoPath, sourceBranch)
+    }
+
+    const result = await window.coda.gitWorktreeAdd(repoPath, sourceBranch)
+    if (result.ok && result.worktree) {
+      set((s) => ({
+        tabs: s.tabs.map((t) =>
+          t.id === tabId
+            ? {
+                ...t,
+                worktree: result.worktree!,
+                workingDirectory: result.worktree!.worktreePath,
+                pendingWorktreeSetup: false,
+              }
+            : t
+        ),
+      }))
+    }
+  },
+
+  cancelWorktreeSetup: (tabId) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, pendingWorktreeSetup: false } : t
+      ),
+    }))
+  },
+
+  finishWorktreeTab: async (tabId, strategyOverride) => {
+    const tab = get().tabs.find((t) => t.id === tabId)
+    if (!tab?.worktree) return
+
+    const strategy = strategyOverride || useThemeStore.getState().worktreeCompletionStrategy
+    const { repoPath, worktreePath, branchName, sourceBranch } = tab.worktree
+
+    if (strategy === 'merge') {
+      const result = await window.coda.gitWorktreeMerge(repoPath, branchName, sourceBranch)
+      if (!result.ok) {
+        // Show error in conversation
+        const msg = result.hasConflicts
+          ? `Merge conflict: resolve manually in ${repoPath} then close this tab.`
+          : `Merge failed: ${result.error}`
+        set((s) => ({
+          tabs: s.tabs.map((t) =>
+            t.id === tabId
+              ? { ...t, messages: [...t.messages, { id: `msg-${++msgCounter}`, role: 'system' as const, content: msg, timestamp: Date.now() }] }
+              : t
+          ),
+        }))
+        return
+      }
+      // Clean up worktree and close
+      await window.coda.gitWorktreeRemove(repoPath, worktreePath, branchName, true).catch(() => {})
+      get().closeTab(tabId)
+    } else {
+      // PR strategy
+      const pushResult = await window.coda.gitWorktreePush(worktreePath, sourceBranch)
+      if (!pushResult.ok) {
+        set((s) => ({
+          tabs: s.tabs.map((t) =>
+            t.id === tabId
+              ? { ...t, messages: [...t.messages, { id: `msg-${++msgCounter}`, role: 'system' as const, content: `Push failed: ${pushResult.error}`, timestamp: Date.now() }] }
+              : t
+          ),
+        }))
+        return
+      }
+      // Open PR URL in browser if we have a remote URL
+      if (pushResult.remoteUrl && pushResult.remoteBranch) {
+        // Construct GitHub/GitLab PR URL
+        const url = pushResult.remoteUrl
+          .replace(/\.git$/, '')
+          .replace(/^git@([^:]+):/, 'https://$1/')
+        window.coda.openExternal(`${url}/compare/${sourceBranch}...${pushResult.remoteBranch}`)
+      }
+      // Clean up worktree and close
+      await window.coda.gitWorktreeRemove(repoPath, worktreePath, branchName, true).catch(() => {})
+      get().closeTab(tabId)
+    }
   },
 
   // ─── Attachment management ───
@@ -1047,9 +1242,17 @@ export const useSessionStore = create<State>((set, get) => ({
     }))
   },
 
+  setDraftInput: (tabId, text) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, draftInput: text } : t
+      ),
+    }))
+  },
+
   // ─── Send ───
 
-  sendMessage: (prompt, projectPath) => {
+  sendMessage: (prompt, projectPath, extraAttachments) => {
     const { activeTabId, tabs, staticInfo } = get()
     const tab = tabs.find((t) => t.id === activeTabId)
     // Use explicitly chosen directory, otherwise fall back to user home
@@ -1059,8 +1262,20 @@ export const useSessionStore = create<State>((set, get) => ({
     // Guard: don't send while connecting (warmup in progress)
     if (tab.status === 'connecting') return
 
+    // Slash commands are action-oriented -- auto-switch out of plan mode
+    // so the command can execute tools without manual approval
+    if (!tab.claudeSessionId && tab.permissionMode === 'plan' && prompt.startsWith('/')) {
+      get().setPermissionMode('auto')
+    }
+
     const isBusy = tab.status === 'running'
     const requestId = crypto.randomUUID()
+
+    // Combine file attachments from tab with any extra attachments (e.g. plan)
+    const msgAttachments: Attachment[] = [
+      ...tab.attachments,
+      ...(extraAttachments || []),
+    ]
 
     // Build full prompt with bash results and attachment context
     let fullPrompt = prompt
@@ -1119,7 +1334,13 @@ export const useSessionStore = create<State>((set, get) => ({
           permissionDenied: null,
           messages: [
             ...withEffectiveBase.messages,
-            { id: nextMsgId(), role: 'user' as const, content: prompt, timestamp: Date.now() },
+            {
+              id: nextMsgId(),
+              role: 'user' as const,
+              content: prompt,
+              attachments: msgAttachments.length > 0 ? msgAttachments : undefined,
+              timestamp: Date.now(),
+            },
           ],
         }
       }),
@@ -1350,9 +1571,15 @@ export const useSessionStore = create<State>((set, get) => ({
             if (tabId !== activeTabId || !s.isExpanded) {
               updated.hasUnread = true
             }
-            // Show fallback card when tools were denied by permission settings
+            // Show fallback card when tools were denied by permission settings.
+            // Filter out ExitPlanMode denials when not in plan mode — the model
+            // may call ExitPlanMode from conversation-history patterns even after
+            // the user exited plan mode (known Claude Code bug).
             if (event.permissionDenials && event.permissionDenials.length > 0) {
-              updated.permissionDenied = { tools: event.permissionDenials }
+              const denials = updated.permissionMode === 'plan'
+                ? event.permissionDenials
+                : event.permissionDenials.filter((d) => d.toolName !== 'ExitPlanMode')
+              updated.permissionDenied = denials.length > 0 ? { tools: denials } : null
             } else {
               updated.permissionDenied = null
             }
@@ -1498,6 +1725,7 @@ function persistTabs(): void {
       permissionMode: t.permissionMode,
       ...(t.bashResults.length > 0 ? { bashResults: t.bashResults } : {}),
       ...(t.pillColor ? { pillColor: t.pillColor } : {}),
+      ...(t.worktree ? { worktree: t.worktree } : {}),
     }))
 
   // Serialize editor states (per-directory, includes unsaved content)
@@ -1524,7 +1752,7 @@ function persistTabs(): void {
   }
 
   // Resolve which persisted tabs have the editor open (by index into persistedTabs)
-  const { isExpanded, fileEditorOpenTabIds, editorGeometry } = useSessionStore.getState()
+  const { isExpanded, fileEditorOpenTabIds, editorGeometry, planGeometry } = useSessionStore.getState()
   const editorOpenIndices: number[] = []
   // Build a lookup from tab id -> persisted index
   let persistedIdx = 0
@@ -1557,13 +1785,14 @@ function persistTabs(): void {
     isExpanded,
     editorOpenSessionIds: editorOpenIndices.length > 0 ? editorOpenIndices : undefined,
     editorGeometry,
+    planGeometry,
   }
   window.coda.saveTabs(data)
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 useSessionStore.subscribe((state, prev) => {
-  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId || state.fileEditorStates !== prev.fileEditorStates || state.isExpanded !== prev.isExpanded || state.fileEditorOpenTabIds !== prev.fileEditorOpenTabIds || state.editorGeometry !== prev.editorGeometry) {
+  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId || state.fileEditorStates !== prev.fileEditorStates || state.isExpanded !== prev.isExpanded || state.fileEditorOpenTabIds !== prev.fileEditorOpenTabIds || state.editorGeometry !== prev.editorGeometry || state.planGeometry !== prev.planGeometry) {
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(persistTabs, 100)
   }

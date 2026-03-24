@@ -1,9 +1,10 @@
 import { app, BrowserWindow, ipcMain, dialog, screen, globalShortcut, Tray, Menu, nativeImage, nativeTheme, shell, systemPreferences } from 'electron'
-import { join } from 'path'
+import { join, basename } from 'path'
 import { existsSync, readdirSync, statSync, createReadStream, readFileSync, writeFileSync, mkdirSync, rmSync, renameSync } from 'fs'
 import { unlink } from 'fs/promises'
 import { createInterface } from 'readline'
 import { homedir } from 'os'
+import { randomBytes } from 'crypto'
 import { execFile as execFileCb, spawn, type ChildProcess } from 'child_process'
 import { promisify } from 'util'
 import { ControlPlane } from './claude/control-plane'
@@ -13,7 +14,7 @@ import { discoverCommands } from './claude/command-discovery'
 import { log as _log, LOG_FILE, flushLogs } from './logger'
 import { getCliEnv } from './cli-env'
 import { IPC } from '../shared/types'
-import type { RunOptions, NormalizedEvent, EnrichedError } from '../shared/types'
+import type { RunOptions, NormalizedEvent, EnrichedError, WorktreeInfo, WorktreeStatus } from '../shared/types'
 import { TerminalManager } from './terminal-manager'
 import { isValidProjectPath, isValidSessionId, validateExternalUrl, buildTerminalCommand } from './ipc-validation'
 
@@ -552,7 +553,7 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
     }
     const files = readdirSync(sessionsDir).filter((f: string) => f.endsWith('.jsonl'))
 
-    const sessions: Array<{ sessionId: string; slug: string | null; firstMessage: string | null; lastTimestamp: string; size: number }> = []
+    const sessions: Array<{ sessionId: string; slug: string | null; firstMessage: string | null; lastResponse: string | null; lastTimestamp: string; size: number }> = []
 
     // UUID v4 regex — only consider files named as valid UUIDs
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -567,8 +568,8 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
       if (stat.size < 100) continue // skip trivially small files
 
       // Read lines to extract metadata and validate transcript schema
-      const meta: { validated: boolean; slug: string | null; firstMessage: string | null; lastTimestamp: string | null } = {
-        validated: false, slug: null, firstMessage: null, lastTimestamp: null,
+      const meta: { validated: boolean; slug: string | null; firstMessage: string | null; lastResponse: string | null; lastTimestamp: string | null } = {
+        validated: false, slug: null, firstMessage: null, lastResponse: null, lastTimestamp: null,
       }
 
       await new Promise<void>((resolve) => {
@@ -606,6 +607,20 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
                 }
               }
             }
+            // Extract last assistant response (overwrites each time so we keep the final one)
+            if (obj.type === 'assistant') {
+              const content = obj.message?.content
+              let raw = ''
+              if (typeof content === 'string') {
+                raw = content
+              } else if (Array.isArray(content)) {
+                raw = (content.find((p: any) => p.type === 'text')?.text) || ''
+              }
+              if (raw) {
+                const cleaned = cleanCliTags(raw).substring(0, 100)
+                if (cleaned) meta.lastResponse = cleaned
+              }
+            }
           } catch {}
           // Read all lines to get the last timestamp
         })
@@ -617,6 +632,7 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
           sessionId: fileSessionId,
           slug: meta.slug,
           firstMessage: meta.firstMessage,
+          lastResponse: meta.lastResponse,
           lastTimestamp: meta.lastTimestamp || stat.mtime.toISOString(),
           size: stat.size,
         })
@@ -690,7 +706,54 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
     const filePath = join(homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)
     if (!existsSync(filePath)) return []
 
-    const messages: Array<{ role: string; content: string; toolName?: string; toolInput?: string; toolId?: string; userExecuted?: boolean; timestamp: number }> = []
+    const messages: Array<{ role: string; content: string; toolName?: string; toolInput?: string; toolId?: string; userExecuted?: boolean; attachments?: Array<{ id: string; type: string; name: string; path: string; mimeType?: string }>; timestamp: number }> = []
+
+    // MIME type lookup for reconstructing attachments from history
+    const extToMime: Record<string, string> = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+      '.txt': 'text/plain', '.md': 'text/markdown',
+      '.json': 'application/json', '.yaml': 'text/yaml', '.yml': 'text/yaml',
+      '.toml': 'text/toml', '.ts': 'text/typescript', '.tsx': 'text/typescript',
+      '.js': 'text/javascript', '.py': 'text/x-python', '.rs': 'text/x-rust',
+      '.go': 'text/x-go',
+    }
+
+    // Extract [Attached type: path] lines from text, returning attachments and cleaned text
+    const parseAttachmentLines = (text: string) => {
+      const attachmentRegex = /^\[Attached (image|file): (.+)\]$/gm
+      const attachments: Array<{ id: string; type: 'image' | 'file'; name: string; path: string; mimeType?: string }> = []
+      let match
+      while ((match = attachmentRegex.exec(text)) !== null) {
+        const aType = match[1] as 'image' | 'file'
+        const aPath = match[2]
+        const aName = aPath.split('/').pop() || aPath
+        const aExt = aName.includes('.') ? '.' + aName.split('.').pop()!.toLowerCase() : ''
+        attachments.push({
+          id: `hist-${Date.now()}-${attachments.length}`,
+          type: aType,
+          name: aName,
+          path: aPath,
+          mimeType: extToMime[aExt],
+        })
+      }
+      const cleaned = text.replace(/^\[Attached (?:image|file): .+\]\n*/gm, '').trim()
+      return { attachments, cleaned }
+    }
+
+    // Find last ExitPlanMode tool message's planFilePath
+    const findLastPlanFilePath = () => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]
+        if (m.toolName === 'ExitPlanMode' && m.toolInput) {
+          try {
+            const input = JSON.parse(m.toolInput)
+            if (input.planFilePath) return input.planFilePath as string
+          } catch {}
+        }
+      }
+      return null
+    }
     await new Promise<void>((resolve) => {
       const rl = createInterface({ input: createReadStream(filePath) })
       rl.on('line', (line: string) => {
@@ -768,7 +831,30 @@ ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPat
                   })
                 }
                 if (remainder.trim()) {
-                  messages.push({ role: 'user', content: remainder.trim(), timestamp: ts })
+                  const { attachments: fileAttachments, cleaned } = parseAttachmentLines(remainder.trim())
+                  const allAttachments: typeof fileAttachments = [...fileAttachments]
+
+                  // Detect plan implementation messages and attach plan reference
+                  const isImplementMsg = cleaned === 'Implement the plan' || cleaned.startsWith('Implement the following plan:')
+                  if (isImplementMsg) {
+                    const planPath = findLastPlanFilePath()
+                    if (planPath) {
+                      const planName = planPath.split('/').pop() || planPath
+                      allAttachments.push({ id: `plan-${Date.now()}`, type: 'plan' as any, name: planName, path: planPath })
+                    }
+                  }
+
+                  // For plan implementation messages with embedded content, show short display text
+                  const displayContent = isImplementMsg && cleaned.startsWith('Implement the following plan:')
+                    ? 'Implement the plan'
+                    : cleaned
+
+                  messages.push({
+                    role: 'user',
+                    content: displayContent,
+                    attachments: allAttachments.length > 0 ? allAttachments : undefined,
+                    timestamp: ts,
+                  })
                 }
               }
             }
@@ -842,13 +928,17 @@ ipcMain.handle(IPC.ATTACH_FILES, async () => {
   if (!mainWindow) return null
   // macOS: activate app so unparented dialog appears on top
   if (process.platform === 'darwin') app.focus()
-  const options = {
+  // macOS NSOpenPanel doesn't reliably handle extensions: ['*'] — omit filters
+  // so all files are selectable. Other platforms get type filter dropdowns.
+  const options: Electron.OpenDialogOptions = {
     properties: ['openFile' as const, 'multiSelections' as const],
-    filters: [
-      { name: 'All Files', extensions: ['*'] },
-      { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
-      { name: 'Code', extensions: ['ts', 'tsx', 'js', 'jsx', 'py', 'rs', 'go', 'md', 'json', 'yaml', 'toml'] },
-    ],
+    ...(process.platform !== 'darwin' && {
+      filters: [
+        { name: 'All Files', extensions: ['*'] },
+        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'] },
+        { name: 'Code', extensions: ['ts', 'tsx', 'js', 'jsx', 'py', 'rs', 'go', 'md', 'json', 'yaml', 'toml'] },
+      ],
+    }),
   }
   const result = process.platform === 'darwin'
     ? await dialog.showOpenDialog(options)
@@ -1299,6 +1389,28 @@ ipcMain.handle(IPC.SAVE_TABS, (_event, data: Record<string, unknown>) => {
   }
 })
 
+// ─── Git Worktree Cleanup ───
+
+async function cleanOrphanedWorktrees(): Promise<void> {
+  const worktreeDir = join(homedir(), '.coda', 'worktrees')
+  if (!existsSync(worktreeDir)) return
+  try {
+    const entries = readdirSync(worktreeDir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const wtPath = join(worktreeDir, entry.name)
+      try {
+        await gitExec('git', ['rev-parse', '--git-dir'], { cwd: wtPath })
+      } catch {
+        log(`Cleaning orphaned worktree: ${wtPath}`)
+        try { rmSync(wtPath, { recursive: true, force: true }) } catch {}
+      }
+    }
+  } catch (err: any) {
+    log(`Worktree cleanup error: ${err.message}`)
+  }
+}
+
 // ─── Git IPC Handlers ───
 
 async function runGit(directory: string, args: string[]): Promise<string> {
@@ -1371,6 +1483,25 @@ ipcMain.handle(IPC.GIT_GRAPH, async (_event, { directory, skip = 0, limit = 100 
     return { commits, isGitRepo: true, totalCount }
   } catch {
     return { commits: [], isGitRepo: true, totalCount: 0 }
+  }
+})
+
+ipcMain.handle(IPC.GIT_COMMIT_DETAIL, async (_event, { directory, hash }: { directory: string; hash: string }) => {
+  try {
+    const output = await runGit(directory, ['show', '--stat', '--format=', hash])
+    // Last non-empty line is the summary, e.g. " 10 files changed, 344 insertions(+), 49 deletions(-)"
+    const lines = output.trim().split('\n')
+    const summary = lines[lines.length - 1] || ''
+    const filesMatch = summary.match(/(\d+)\s+files?\s+changed/)
+    const insMatch = summary.match(/(\d+)\s+insertions?\(\+\)/)
+    const delMatch = summary.match(/(\d+)\s+deletions?\(-\)/)
+    return {
+      filesChanged: filesMatch ? parseInt(filesMatch[1], 10) : 0,
+      insertions: insMatch ? parseInt(insMatch[1], 10) : 0,
+      deletions: delMatch ? parseInt(delMatch[1], 10) : 0,
+    }
+  } catch {
+    return { filesChanged: 0, insertions: 0, deletions: 0 }
   }
 })
 
@@ -1601,6 +1732,138 @@ ipcMain.handle(IPC.GIT_DELETE_BRANCH, async (_event, { directory, branch }: { di
   }
 })
 
+// ─── Git Worktree Handlers ───
+
+ipcMain.handle(IPC.GIT_WORKTREE_ADD, async (_event, { repoPath, sourceBranch }: { repoPath: string; sourceBranch: string }) => {
+  try {
+    const id = randomBytes(4).toString('hex')
+    const branchName = `wt/${randomBytes(4).toString('hex')}`
+    const worktreeDir = join(homedir(), '.coda', 'worktrees')
+    const worktreePath = join(worktreeDir, `${basename(repoPath)}-${id}`)
+    mkdirSync(worktreeDir, { recursive: true })
+    await runGit(repoPath, ['worktree', 'add', '-b', branchName, worktreePath, sourceBranch])
+    const worktree: WorktreeInfo = { worktreePath, branchName, sourceBranch, repoPath }
+    return { ok: true, worktree }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_WORKTREE_REMOVE, async (_event, { repoPath, worktreePath, branchName, force }: { repoPath: string; worktreePath: string; branchName: string; force?: boolean }) => {
+  try {
+    const removeArgs = ['worktree', 'remove', worktreePath]
+    if (force) removeArgs.push('--force')
+    await runGit(repoPath, removeArgs)
+    // Delete the branch -- ignore errors if already gone
+    try { await runGit(repoPath, ['branch', '-D', branchName]) } catch {}
+    // Try to remove parent directory if empty
+    try {
+      const parent = join(worktreePath, '..')
+      const entries = readdirSync(parent)
+      if (entries.length === 0) rmSync(parent, { recursive: true })
+    } catch {}
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_WORKTREE_LIST, async (_event, { repoPath }: { repoPath: string }) => {
+  try {
+    const raw = await runGit(repoPath, ['worktree', 'list', '--porcelain'])
+    const worktrees: Array<{ path: string; branch: string; head: string }> = []
+    const blocks = raw.trim().split('\n\n')
+    for (const block of blocks) {
+      if (!block.trim()) continue
+      const lines = block.trim().split('\n')
+      let wtPath = ''
+      let head = ''
+      let branch = ''
+      for (const line of lines) {
+        if (line.startsWith('worktree ')) wtPath = line.slice('worktree '.length)
+        else if (line.startsWith('HEAD ')) head = line.slice('HEAD '.length)
+        else if (line.startsWith('branch ')) branch = line.slice('branch refs/heads/'.length)
+      }
+      if (wtPath) worktrees.push({ path: wtPath, branch, head })
+    }
+    return { worktrees }
+  } catch (err: any) {
+    return { worktrees: [] }
+  }
+})
+
+ipcMain.handle(IPC.GIT_WORKTREE_STATUS, async (_event, { worktreePath, sourceBranch }: { worktreePath: string; sourceBranch: string }) => {
+  try {
+    const statusOutput = await runGit(worktreePath, ['status', '--porcelain'])
+    const hasUncommittedChanges = statusOutput.trim().length > 0
+
+    let aheadCount = 0
+    let behindCount = 0
+    try {
+      const ahead = await runGit(worktreePath, ['rev-list', '--count', `${sourceBranch}..HEAD`])
+      aheadCount = parseInt(ahead.trim(), 10) || 0
+    } catch {}
+    try {
+      const behind = await runGit(worktreePath, ['rev-list', '--count', `HEAD..${sourceBranch}`])
+      behindCount = parseInt(behind.trim(), 10) || 0
+    } catch {}
+
+    let isMerged = false
+    try {
+      await runGit(worktreePath, ['merge-base', '--is-ancestor', 'HEAD', sourceBranch])
+      isMerged = true
+    } catch {}
+
+    const status: WorktreeStatus = {
+      hasUncommittedChanges,
+      hasUnpushedCommits: aheadCount > 0,
+      isMerged,
+      aheadCount,
+      behindCount,
+    }
+    return status
+  } catch (err: any) {
+    return { hasUncommittedChanges: false, hasUnpushedCommits: false, isMerged: false, aheadCount: 0, behindCount: 0 }
+  }
+})
+
+ipcMain.handle(IPC.GIT_WORKTREE_MERGE, async (_event, { repoPath, worktreeBranch, sourceBranch }: { repoPath: string; worktreeBranch: string; sourceBranch: string }) => {
+  try {
+    await runGit(repoPath, ['checkout', sourceBranch])
+    await runGit(repoPath, ['merge', '--no-ff', worktreeBranch])
+    return { ok: true }
+  } catch (err: any) {
+    const msg = err.message || ''
+    if (msg.includes('CONFLICT') || msg.includes('Merge conflict')) {
+      return { ok: false, hasConflicts: true, error: msg }
+    }
+    return { ok: false, error: msg }
+  }
+})
+
+ipcMain.handle(IPC.GIT_WORKTREE_PUSH, async (_event, { worktreePath }: { worktreePath: string }) => {
+  try {
+    await runGit(worktreePath, ['push', '-u', 'origin', 'HEAD'])
+    const remoteUrl = (await runGit(worktreePath, ['remote', 'get-url', 'origin'])).trim()
+    const remoteBranch = (await runGit(worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim()
+    return { ok: true, remoteBranch, remoteUrl }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+})
+
+ipcMain.handle(IPC.GIT_WORKTREE_REBASE, async (_event, { worktreePath, sourceBranch }: { worktreePath: string; sourceBranch: string }) => {
+  try {
+    await runGit(worktreePath, ['fetch', 'origin'])
+    await runGit(worktreePath, ['rebase', sourceBranch])
+    return { ok: true }
+  } catch (err: any) {
+    const msg = err.message || ''
+    const hasConflicts = msg.includes('CONFLICT') || msg.includes('could not apply')
+    return { ok: false, error: msg, hasConflicts }
+  }
+})
+
 // ─── Filesystem Operations ───
 
 ipcMain.handle(IPC.FS_READ_DIR, async (_event, { directory }: { directory: string }) => {
@@ -1769,6 +2032,9 @@ app.whenReady().then(async () => {
     log(`Skill ${status.name}: ${status.state}${status.error ? ` — ${status.error}` : ''}`)
     broadcast(IPC.SKILL_STATUS, status)
   }).catch((err: Error) => log(`Skill provisioning error: ${err.message}`))
+
+  // Clean up orphaned worktree directories (fire and forget)
+  cleanOrphanedWorktrees().catch((err: Error) => log(`Worktree cleanup failed: ${err.message}`))
 
   createWindow()
   snapshotWindowState('after createWindow')
