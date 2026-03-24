@@ -12,6 +12,7 @@ import { PermissionCard } from './PermissionCard'
 import { PermissionDeniedCard } from './PermissionDeniedCard'
 import { PlanViewer } from './PlanViewer'
 import { useColors, useThemeStore } from '../theme'
+import { InlineEditDiff } from './InlineEditDiff'
 import type { Message, Attachment } from '../../shared/types'
 
 // ─── Constants ───
@@ -19,6 +20,23 @@ import type { Message, Attachment } from '../../shared/types'
 const INITIAL_RENDER_CAP = 100
 const PAGE_SIZE = 100
 const REMARK_PLUGINS = [remarkGfm] // Hoisted — prevents re-parse on every render
+
+// ─── Helpers ───
+
+/** Serialize conversation messages into compact text context, filtering out
+ *  plan-mode artifacts. Used to prime a fresh session with prior context. */
+function serializeConversation(messages: Message[]): string {
+  const lines: string[] = []
+  for (const msg of messages) {
+    if (msg.toolName === 'ExitPlanMode' || msg.toolName === 'EnterPlanMode') continue
+    if (msg.role === 'user') {
+      lines.push(`User: ${msg.content}`)
+    } else if (msg.role === 'assistant' && msg.content && !msg.toolName) {
+      lines.push(`Assistant: ${msg.content}`)
+    }
+  }
+  return lines.join('\n\n')
+}
 
 // ─── Types ───
 
@@ -248,20 +266,23 @@ export function ConversationView() {
                   } catch {}
                 }
 
-                if (clearContext) {
-                  // Read plan content to embed in prompt
-                  let planContent: string | null = null
-                  if (planFilePath) {
-                    try {
-                      const result = await window.coda.readPlan(planFilePath)
-                      planContent = result.content
-                    } catch (err) {
-                      console.warn('Failed to read plan file:', err)
-                    }
+                // Read plan content for both paths
+                let planContent: string | null = null
+                if (planFilePath) {
+                  try {
+                    const result = await window.coda.readPlan(planFilePath)
+                    planContent = result.content
+                  } catch (err) {
+                    console.warn('Failed to read plan file:', err)
                   }
+                }
 
-                  // Reset session (fresh Claude context) and clear messages
-                  window.coda.resetTabSession(tab.id)
+                // Both paths start a fresh Claude session to break out of
+                // plan mode (known Claude Code bug: #32868, #32934).
+                window.coda.resetTabSession(tab.id)
+
+                if (clearContext) {
+                  // Clear UI messages
                   useSessionStore.setState((s) => ({
                     tabs: s.tabs.map((t) =>
                       t.id === tab.id
@@ -270,10 +291,29 @@ export function ConversationView() {
                     ),
                   }))
 
-                  // Include plan content in the prompt
                   if (planContent) {
                     implementPrompt = `Implement the following plan:\n\n${planContent}`
                   }
+                } else {
+                  // Keep UI messages but start fresh Claude session.
+                  // Prime the new session with serialized conversation context
+                  // so the model has full prior context without plan-mode history.
+                  useSessionStore.setState((s) => ({
+                    tabs: s.tabs.map((t) =>
+                      t.id === tab.id ? { ...t, claudeSessionId: null } : t
+                    ),
+                  }))
+
+                  const conversationContext = serializeConversation(tab.messages)
+                  const parts: string[] = []
+                  if (conversationContext) {
+                    parts.push(`<previous_conversation>\n${conversationContext}\n</previous_conversation>`)
+                  }
+                  if (planContent) {
+                    parts.push(`<plan>\n${planContent}\n</plan>`)
+                  }
+                  parts.push('The plan above has been approved. Implement it now, making changes directly.')
+                  implementPrompt = parts.join('\n\n')
                 }
 
                 // Build plan attachment for the message
@@ -837,10 +877,29 @@ function getToolDescription(name: string, input?: string): string {
 }
 
 function ToolResultBadge({ tool, colors }: { tool: Message; colors: ReturnType<typeof useColors> }) {
-  const [showResult, setShowResult] = useState(!!tool.userExecuted || !!tool.autoExpandResult)
+  const expandToolResults = useThemeStore((s) => s.expandToolResults)
+  const shouldAutoExpand = !!tool.autoExpandResult ||
+    (expandToolResults && ['Edit', 'Write'].includes(tool.toolName || ''))
+  const [showResult, setShowResult] = useState(!!tool.userExecuted || shouldAutoExpand)
   const isError = tool.toolStatus === 'error'
-  const hasContent = !!tool.content
-  const lineCount = hasContent ? tool.content.split('\n').length : 0
+
+  // Parse Edit/Write tool input for diff rendering
+  const editDiff = useMemo(() => {
+    if (tool.toolName !== 'Edit' || !tool.toolInput) return null
+    try {
+      const input = JSON.parse(tool.toolInput)
+      if (typeof input.old_string === 'string' && typeof input.new_string === 'string') {
+        return { oldString: input.old_string, newString: input.new_string }
+      }
+    } catch { /* fallback to raw content */ }
+    return null
+  }, [tool.toolName, tool.toolInput])
+
+  const hasContent = !!tool.content || !!editDiff
+  const lineCount = editDiff
+    ? (editDiff.oldString ? editDiff.oldString.split('\n').length : 0) +
+      (editDiff.newString ? editDiff.newString.split('\n').length : 0)
+    : tool.content ? tool.content.split('\n').length : 0
 
   return (
     <>
@@ -864,14 +923,17 @@ function ToolResultBadge({ tool, colors }: { tool: Message; colors: ReturnType<t
           </span>
         )}
       </span>
-      {showResult && tool.content && (
+      {showResult && editDiff && (
+        <InlineEditDiff oldString={editDiff.oldString} newString={editDiff.newString} />
+      )}
+      {showResult && !editDiff && tool.content && (
         <pre
           className="text-[11px] leading-[1.4] p-2 rounded overflow-auto whitespace-pre-wrap break-words"
           style={{
             margin: '4px 0 0 0',
             background: colors.surfaceHover,
             color: colors.textSecondary,
-            maxHeight: tool.autoExpandResult ? undefined : 200,
+            maxHeight: shouldAutoExpand ? undefined : 200,
             border: `1px solid ${colors.toolBorder}`,
           }}
         >

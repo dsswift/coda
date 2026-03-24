@@ -161,6 +161,8 @@ export interface TabState {
   /** Fallback card when tools were denied and no interactive permission is available */
   permissionDenied: { tools: Array<{ toolName: string; toolUseId: string }> } | null
   attachments: FileAttachment[]
+  /** Draft input text for this tab's input bar (scoped per-tab) */
+  draftInput: string
   messages: Message[]
   title: string
   /** User-provided custom tab name (overrides auto-generated title when set) */
@@ -191,6 +193,10 @@ export interface TabState {
   bashExecId: string | null
   /** Custom pill outline color (null = use theme default) */
   pillColor: string | null
+  /** Worktree metadata when tab operates inside a managed worktree */
+  worktree: WorktreeInfo | null
+  /** True while waiting for the user to pick a source branch in the BranchPickerDialog */
+  pendingWorktreeSetup: boolean
 }
 
 export interface Message {
@@ -424,6 +430,16 @@ export const IPC = {
   GIT_UNSTAGE: 'coda:git-unstage',
   GIT_DISCARD: 'coda:git-discard',
   GIT_DELETE_BRANCH: 'coda:git-delete-branch',
+  GIT_COMMIT_DETAIL: 'coda:git-commit-detail',
+
+  // Git worktree operations
+  GIT_WORKTREE_ADD: 'coda:git-worktree-add',
+  GIT_WORKTREE_REMOVE: 'coda:git-worktree-remove',
+  GIT_WORKTREE_LIST: 'coda:git-worktree-list',
+  GIT_WORKTREE_STATUS: 'coda:git-worktree-status',
+  GIT_WORKTREE_MERGE: 'coda:git-worktree-merge',
+  GIT_WORKTREE_PUSH: 'coda:git-worktree-push',
+  GIT_WORKTREE_REBASE: 'coda:git-worktree-rebase',
 
   // Filesystem operations
   FS_READ_DIR: 'coda:fs-read-dir',
@@ -470,6 +486,7 @@ export interface PersistedTab {
   permissionMode: 'ask' | 'auto' | 'plan'
   bashResults?: Array<{ command: string; stdout: string; stderr: string }>
   pillColor?: string | null
+  worktree?: WorktreeInfo | null
 }
 
 export interface PersistedEditorFile {
@@ -523,6 +540,12 @@ export interface GitRef {
   isCurrent: boolean
 }
 
+export interface GitCommitDetail {
+  filesChanged: number
+  insertions: number
+  deletions: number
+}
+
 export interface GitGraphData {
   commits: GitCommit[]
   isGitRepo: boolean
@@ -547,6 +570,30 @@ export interface GitBranchInfo {
   isCurrent: boolean
   upstream: string | null
   isRemote: boolean
+}
+
+// ─── Worktree Types ───
+
+export type GitOpsMode = 'manual' | 'worktree'
+export type WorktreeCompletionStrategy = 'merge' | 'pr'
+
+export interface WorktreeInfo {
+  /** Physical path on disk (~/.coda/worktrees/...) */
+  worktreePath: string
+  /** Auto-generated branch name (wt/<nanoid>) */
+  branchName: string
+  /** Branch the worktree was created from */
+  sourceBranch: string
+  /** Original repo root path */
+  repoPath: string
+}
+
+export interface WorktreeStatus {
+  hasUncommittedChanges: boolean
+  hasUnpushedCommits: boolean
+  isMerged: boolean
+  aheadCount: number
+  behindCount: number
 }
 
 // ─── Filesystem Types ───
