@@ -88,6 +88,7 @@ export function ConversationView() {
   const prevTabIdRef = useRef(activeTabId)
   const colors = useColors()
   const expandedUI = useThemeStore((s) => s.expandedUI)
+  const isTallView = useSessionStore((s) => s.tallViewTabId === s.activeTabId)
 
   const tab = tabs.find((t) => t.id === activeTabId)
 
@@ -169,7 +170,7 @@ export function ConversationView() {
       <div
         ref={scrollRef}
         className="overflow-y-auto overflow-x-hidden px-4 pt-2 conversation-selectable"
-        style={{ maxHeight: expandedUI ? 460 : 336, paddingBottom: 28 }}
+        style={{ maxHeight: isTallView ? 'calc(100vh - 260px)' : expandedUI ? 460 : 336, paddingBottom: 28 }}
         onScroll={handleScroll}
       >
         {/* Load older button */}
@@ -296,24 +297,16 @@ export function ConversationView() {
                   }
                 } else {
                   // Keep UI messages but start fresh Claude session.
-                  // Prime the new session with serialized conversation context
-                  // so the model has full prior context without plan-mode history.
+                  // Conversation context goes via system prompt (invisible to user).
                   useSessionStore.setState((s) => ({
                     tabs: s.tabs.map((t) =>
                       t.id === tab.id ? { ...t, claudeSessionId: null } : t
                     ),
                   }))
 
-                  const conversationContext = serializeConversation(tab.messages)
-                  const parts: string[] = []
-                  if (conversationContext) {
-                    parts.push(`<previous_conversation>\n${conversationContext}\n</previous_conversation>`)
-                  }
                   if (planContent) {
-                    parts.push(`<plan>\n${planContent}\n</plan>`)
+                    implementPrompt = `Implement the following plan:\n\n${planContent}`
                   }
-                  parts.push('The plan above has been approved. Implement it now, making changes directly.')
-                  implementPrompt = parts.join('\n\n')
                 }
 
                 // Build plan attachment for the message
@@ -324,7 +317,17 @@ export function ConversationView() {
                   path: planFilePath,
                 }] : undefined
 
-                sendMessage(implementPrompt, undefined, planAttachment)
+                // For non-clear-context, inject prior conversation as system
+                // prompt context so the model has full history without plan-mode
+                // patterns, but the user only sees "Implement the plan".
+                const contextPrompt = !clearContext
+                  ? serializeConversation(tab.messages)
+                  : undefined
+                const appendSys = contextPrompt
+                  ? `The following is the conversation history from the planning session. Use it as context for implementation.\n\n<previous_conversation>\n${contextPrompt}\n</previous_conversation>`
+                  : undefined
+
+                sendMessage(implementPrompt, undefined, planAttachment, appendSys)
               }}
             />
           )}
@@ -876,12 +879,11 @@ function getToolDescription(name: string, input?: string): string {
   }
 }
 
-function ToolResultBadge({ tool, colors }: { tool: Message; colors: ReturnType<typeof useColors> }) {
+function ToolRow({ tool, desc, isRunning, colors }: { tool: Message; desc: string; isRunning: boolean; colors: ReturnType<typeof useColors> }) {
   const expandToolResults = useThemeStore((s) => s.expandToolResults)
   const shouldAutoExpand = !!tool.autoExpandResult ||
     (expandToolResults && ['Edit', 'Write'].includes(tool.toolName || ''))
   const [showResult, setShowResult] = useState(!!tool.userExecuted || shouldAutoExpand)
-  const isError = tool.toolStatus === 'error'
 
   // Parse Edit/Write tool input for diff rendering
   const editDiff = useMemo(() => {
@@ -903,30 +905,32 @@ function ToolResultBadge({ tool, colors }: { tool: Message; colors: ReturnType<t
 
   return (
     <>
-      <span className="inline-flex items-center gap-1 mt-0.5">
+      <span className="inline-flex items-center gap-1.5">
         <span
-          className="inline-block text-[10px] px-1.5 py-[1px] rounded"
-          style={{
-            background: isError ? colors.statusErrorBg : colors.statusCompleteBg,
-            color: isError ? colors.statusError : colors.statusComplete,
-          }}
+          className="text-[12px] leading-[1.4] truncate"
+          style={{ color: isRunning ? colors.textSecondary : colors.textTertiary }}
         >
-          {isError ? 'Error' : 'Success'}
+          {desc}
         </span>
-        {hasContent && (
+        {!isRunning && hasContent && (
           <span
-            className="text-[10px] cursor-pointer select-none"
+            className="text-[10px] cursor-pointer select-none flex-shrink-0"
             style={{ color: colors.textMuted }}
             onClick={() => setShowResult(!showResult)}
           >
             +{lineCount} line{lineCount !== 1 ? 's' : ''}
           </span>
         )}
+        {isRunning && (
+          <span className="text-[10px]" style={{ color: colors.textMuted }}>
+            running...
+          </span>
+        )}
       </span>
-      {showResult && editDiff && (
+      {!isRunning && showResult && editDiff && (
         <InlineEditDiff oldString={editDiff.oldString} newString={editDiff.newString} />
       )}
-      {showResult && !editDiff && tool.content && (
+      {!isRunning && showResult && !editDiff && tool.content && (
         <pre
           className="text-[11px] leading-[1.4] p-2 rounded overflow-auto whitespace-pre-wrap break-words"
           style={{
@@ -986,7 +990,7 @@ function ToolGroup({ tools, skipMotion }: { tools: Message[]; skipMotion?: boole
             style={{ background: colors.timelineLine }}
           />
 
-          <div className="space-y-3">
+          <div className="space-y-1.5">
             {tools.map((tool) => {
               const isRunning = tool.toolStatus === 'running'
               const toolName = tool.toolName || 'Tool'
@@ -996,37 +1000,17 @@ function ToolGroup({ tools, skipMotion }: { tools: Message[]; skipMotion?: boole
                 <div key={tool.id} className="relative">
                   {/* Timeline node */}
                   <div
-                    className="absolute -left-6 top-[1px] w-[20px] h-[20px] rounded-full flex items-center justify-center"
-                    style={{
-                      background: isRunning ? colors.toolRunningBg : colors.toolBg,
-                      border: `1px solid ${isRunning ? colors.toolRunningBorder : colors.toolBorder}`,
-                    }}
+                    className="absolute -left-6 top-[5px] w-[20px] flex items-center justify-center"
                   >
                     {isRunning
                       ? <SpinnerGap size={10} className="animate-spin" style={{ color: colors.statusRunning }} />
-                      : <ToolIcon name={toolName} size={10} />
+                      : <ToolIcon name={toolName} size={10} status={tool.toolStatus} />
                     }
                   </div>
 
-                  {/* Tool description */}
+                  {/* Tool row: description + optional line count, expandable content below */}
                   <div className="min-w-0">
-                    <span
-                      className="text-[12px] leading-[1.4] block truncate"
-                      style={{ color: isRunning ? colors.textSecondary : colors.textTertiary }}
-                    >
-                      {desc}
-                    </span>
-
-                    {/* Result badge */}
-                    {!isRunning && (
-                      <ToolResultBadge tool={tool} colors={colors} />
-                    )}
-
-                    {isRunning && (
-                      <span className="text-[10px] mt-0.5 block" style={{ color: colors.textMuted }}>
-                        running...
-                      </span>
-                    )}
+                    <ToolRow tool={tool} desc={desc} isRunning={isRunning} colors={colors} />
                   </div>
                 </div>
               )
@@ -1115,7 +1099,7 @@ function SystemMessage({ message, skipMotion }: { message: Message; skipMotion?:
 
 // ─── Tool Icon mapping ───
 
-function ToolIcon({ name, size = 12 }: { name: string; size?: number }) {
+function ToolIcon({ name, size = 12, status }: { name: string; size?: number; status?: string }) {
   const colors = useColors()
   const ICONS: Record<string, React.ReactNode> = {
     Read: <FileText size={size} />,
@@ -1130,8 +1114,12 @@ function ToolIcon({ name, size = 12 }: { name: string; size?: number }) {
     AskUserQuestion: <Question size={size} />,
   }
 
+  const iconColor = status === 'error' ? colors.statusError
+    : status === 'completed' ? colors.statusComplete
+    : colors.textTertiary
+
   return (
-    <span className="flex items-center" style={{ color: colors.textTertiary }}>
+    <span className="flex items-center" style={{ color: iconColor }}>
       {ICONS[name] || <Wrench size={size} />}
     </span>
   )
