@@ -149,7 +149,8 @@ interface State {
   installMarketplacePlugin: (plugin: CatalogPlugin) => Promise<void>
   uninstallMarketplacePlugin: (plugin: CatalogPlugin) => Promise<void>
   buildYourOwn: () => void
-  resumeSession: (sessionId: string, title?: string, projectPath?: string) => Promise<string>
+  forkTab: (sourceTabId: string) => Promise<string | null>
+  resumeSession: (sessionId: string, title?: string, projectPath?: string, customTitle?: string | null) => Promise<string>
   addSystemMessage: (content: string) => void
   startBashCommand: (command: string, execId: string) => { toolMsgId: string; tabId: string }
   completeBashCommand: (tabId: string, toolMsgId: string, command: string, stdout: string, stderr: string, exitCode: number | null) => void
@@ -192,6 +193,7 @@ function makeLocalTab(): TabState {
   return {
     id: crypto.randomUUID(),
     claudeSessionId: null,
+    historicalSessionIds: [],
     status: 'idle',
     activeRequestId: null,
     hasUnread: false,
@@ -218,6 +220,7 @@ function makeLocalTab(): TabState {
     bashExecuting: false,
     bashExecId: null,
     pillColor: null,
+    forkedFromSessionId: null,
     worktree: null,
     pendingWorktreeSetup: false,
   }
@@ -873,6 +876,11 @@ export const useSessionStore = create<State>((set, get) => ({
         t.id === tabId ? { ...t, customTitle } : t
       ),
     }))
+    // Persist custom title to session-labels.json so it survives tab close/restore
+    const tab = get().tabs.find((t) => t.id === tabId)
+    if (tab?.claudeSessionId) {
+      void window.coda.saveSessionLabel(tab.claudeSessionId, customTitle)
+    }
   },
 
   setTabPillColor: (tabId, color) => {
@@ -894,7 +902,51 @@ export const useSessionStore = create<State>((set, get) => ({
     }))
   },
 
-  resumeSession: async (sessionId, title, projectPath) => {
+  forkTab: async (sourceTabId) => {
+    const source = get().tabs.find((t) => t.id === sourceTabId)
+    if (!source || !source.claudeSessionId) return null
+    try {
+      const { tabId } = await window.coda.createTab()
+
+      // Deep-copy messages with fresh IDs
+      const messages: Message[] = source.messages.map((m) => ({
+        ...m,
+        id: nextMsgId(),
+      }))
+
+      // Restore plan-ready state if last tool message was ExitPlanMode
+      const lastToolMsg = [...messages].reverse().find((m) => m.toolName)
+      const restoredDenied = lastToolMsg?.toolName === 'ExitPlanMode'
+        ? { tools: [{ toolName: 'ExitPlanMode', toolUseId: 'restored' }] }
+        : null
+
+      const tab: TabState = {
+        ...makeLocalTab(),
+        id: tabId,
+        claudeSessionId: null,
+        forkedFromSessionId: source.claudeSessionId,
+        title: source.title,
+        customTitle: source.customTitle,
+        workingDirectory: source.workingDirectory,
+        hasChosenDirectory: source.hasChosenDirectory,
+        additionalDirs: [...source.additionalDirs],
+        permissionMode: source.permissionMode,
+        pillColor: source.pillColor,
+        messages,
+        permissionDenied: restoredDenied,
+      }
+      set((s) => ({
+        tabs: [...s.tabs, tab],
+        activeTabId: tab.id,
+        isExpanded: true,
+      }))
+      return tabId
+    } catch {
+      return null
+    }
+  },
+
+  resumeSession: async (sessionId, title, projectPath, customTitle) => {
     const defaultDir = projectPath || get().staticInfo?.homePath || '~'
     try {
       const { tabId } = await window.coda.createTab()
@@ -925,6 +977,7 @@ export const useSessionStore = create<State>((set, get) => ({
         id: tabId,
         claudeSessionId: sessionId,
         title: title || 'Resumed Session',
+        customTitle: customTitle || null,
         workingDirectory: defaultDir,
         hasChosenDirectory: !!projectPath,
         messages,
@@ -941,6 +994,7 @@ export const useSessionStore = create<State>((set, get) => ({
       const tab = makeLocalTab()
       tab.claudeSessionId = sessionId
       tab.title = title || 'Resumed Session'
+      tab.customTitle = customTitle || null
       tab.workingDirectory = defaultDir
       tab.hasChosenDirectory = !!projectPath
       set((s) => ({
@@ -1096,6 +1150,7 @@ export const useSessionStore = create<State>((set, get) => ({
               ...t,
               workingDirectory: dir,
               hasChosenDirectory: true,
+              historicalSessionIds: [],
               claudeSessionId: null,
               additionalDirs: [],
               worktree: null,
@@ -1301,8 +1356,8 @@ export const useSessionStore = create<State>((set, get) => ({
       }).join('\n\n')
       fullPrompt = bashCtx + '\n\n' + fullPrompt
     }
-    if (tab.attachments.length > 0) {
-      const attachmentCtx = tab.attachments
+    if (msgAttachments.length > 0) {
+      const attachmentCtx = msgAttachments
         .map((a) => `[Attached ${a.type}: ${a.path}]`)
         .join('\n')
       fullPrompt = `${attachmentCtx}\n\n${fullPrompt}`
@@ -1361,13 +1416,31 @@ export const useSessionStore = create<State>((set, get) => ({
 
     // Send to backend — ControlPlane will queue if a run is active
     const { preferredModel } = get()
+
+    // For forked tabs on first message: inject prior conversation as system context
+    let effectiveSystemPrompt = appendSystemPrompt || undefined
+    if (tab.forkedFromSessionId && !tab.claudeSessionId) {
+      const priorMessages = tab.messages
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .filter((m) => m.content.trim().length > 0)
+      if (priorMessages.length > 0) {
+        const transcript = priorMessages
+          .map((m) => `[${m.role}]: ${m.content}`)
+          .join('\n\n')
+        const forkCtx = `This conversation was forked from a previous session. Here is the conversation history up to the fork point:\n\n<prior-conversation>\n${transcript}\n</prior-conversation>\n\nContinue from this point. The user's next message is the first message in this forked conversation.`
+        effectiveSystemPrompt = effectiveSystemPrompt
+          ? `${effectiveSystemPrompt}\n\n${forkCtx}`
+          : forkCtx
+      }
+    }
+
     window.coda.prompt(activeTabId, requestId, {
       prompt: fullPrompt,
       projectPath: resolvedPath,
       sessionId: tab.claudeSessionId || undefined,
       model: preferredModel || undefined,
       addDirs: tab.additionalDirs.length > 0 ? tab.additionalDirs : undefined,
-      appendSystemPrompt: appendSystemPrompt || undefined,
+      appendSystemPrompt: effectiveSystemPrompt,
     }).catch((err: Error) => {
       get().handleError(activeTabId, {
         message: err.message,
@@ -1390,6 +1463,10 @@ export const useSessionStore = create<State>((set, get) => ({
 
         switch (event.type) {
           case 'session_init':
+            if (updated.claudeSessionId && updated.claudeSessionId !== event.sessionId
+                && !updated.historicalSessionIds.includes(updated.claudeSessionId)) {
+              updated.historicalSessionIds = [...updated.historicalSessionIds, updated.claudeSessionId]
+            }
             updated.claudeSessionId = event.sessionId
             updated.sessionModel = event.model
             updated.sessionTools = event.tools
@@ -1735,7 +1812,7 @@ function persistTabs(): void {
   }
 
   const persistedTabs = tabs
-    .filter((t) => t.claudeSessionId || (t.hasChosenDirectory && dirsWithEditorState.has(t.workingDirectory)))
+    .filter((t) => t.claudeSessionId || t.historicalSessionIds.length > 0 || (t.hasChosenDirectory && dirsWithEditorState.has(t.workingDirectory)))
     .map((t) => ({
       claudeSessionId: t.claudeSessionId,
       title: t.customTitle || t.title,
@@ -1744,8 +1821,10 @@ function persistTabs(): void {
       hasChosenDirectory: t.hasChosenDirectory,
       additionalDirs: t.additionalDirs,
       permissionMode: t.permissionMode,
+      ...(t.historicalSessionIds.length > 0 ? { historicalSessionIds: t.historicalSessionIds } : {}),
       ...(t.bashResults.length > 0 ? { bashResults: t.bashResults } : {}),
       ...(t.pillColor ? { pillColor: t.pillColor } : {}),
+      ...(t.forkedFromSessionId ? { forkedFromSessionId: t.forkedFromSessionId } : {}),
       ...(t.worktree ? { worktree: t.worktree } : {}),
     }))
 

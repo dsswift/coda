@@ -48,6 +48,10 @@ type GroupedItem =
 
 // ─── Helpers ───
 
+const HIDDEN_MESSAGES = [
+  'Plan mode is not active. Do not create plans or call ExitPlanMode. Implement the requested changes directly using Edit, Write, and Bash tools.',
+]
+
 function groupMessages(messages: Message[]): GroupedItem[] {
   const result: GroupedItem[] = []
   let toolBuf: Message[] = []
@@ -60,6 +64,7 @@ function groupMessages(messages: Message[]): GroupedItem[] {
   }
 
   for (const msg of messages) {
+    if (msg.role === 'assistant' && HIDDEN_MESSAGES.includes(msg.content.trim())) continue
     if (msg.role === 'tool') {
       toolBuf.push(msg)
     } else {
@@ -287,7 +292,21 @@ export function ConversationView() {
                   useSessionStore.setState((s) => ({
                     tabs: s.tabs.map((t) =>
                       t.id === tab.id
-                        ? { ...t, messages: [], claudeSessionId: null, lastResult: null, currentActivity: '', permissionQueue: [], permissionDenied: null, queuedPrompts: [] }
+                        ? {
+                            ...t,
+                            messages: [],
+                            historicalSessionIds: [
+                              ...t.historicalSessionIds,
+                              ...(t.claudeSessionId && !t.historicalSessionIds.includes(t.claudeSessionId)
+                                ? [t.claudeSessionId] : []),
+                            ],
+                            claudeSessionId: null,
+                            lastResult: null,
+                            currentActivity: '',
+                            permissionQueue: [],
+                            permissionDenied: null,
+                            queuedPrompts: [],
+                          }
                         : t
                     ),
                   }))
@@ -300,7 +319,17 @@ export function ConversationView() {
                   // Conversation context goes via system prompt (invisible to user).
                   useSessionStore.setState((s) => ({
                     tabs: s.tabs.map((t) =>
-                      t.id === tab.id ? { ...t, claudeSessionId: null } : t
+                      t.id === tab.id
+                        ? {
+                            ...t,
+                            historicalSessionIds: [
+                              ...t.historicalSessionIds,
+                              ...(t.claudeSessionId && !t.historicalSessionIds.includes(t.claudeSessionId)
+                                ? [t.claudeSessionId] : []),
+                            ],
+                            claudeSessionId: null,
+                          }
+                        : t
                     ),
                   }))
 
@@ -609,6 +638,23 @@ function UserMessage({ message, skipMotion }: { message: Message; skipMotion?: b
 
   const hasAttachments = message.attachments && message.attachments.length > 0
 
+  const userMarkdownComponents = useMemo(() => ({
+    table: ({ children }: any) => <TableScrollWrapper>{children}</TableScrollWrapper>,
+    a: ({ href, children }: any) => (
+      <button
+        type="button"
+        className="underline decoration-dotted underline-offset-2 cursor-pointer"
+        style={{ color: colors.accent }}
+        onClick={() => {
+          if (href) window.coda.openExternal(String(href))
+        }}
+      >
+        {children}
+      </button>
+    ),
+    img: ({ src, alt }: any) => <ImageCard src={src} alt={alt} colors={colors} />,
+  }), [colors])
+
   const content = (
     <div
       className="text-[13px] leading-[1.5] px-3 py-1.5 max-w-[85%]"
@@ -617,10 +663,13 @@ function UserMessage({ message, skipMotion }: { message: Message; skipMotion?: b
         color: colors.userBubbleText,
         border: isBashCmd ? '2px solid rgba(244, 114, 182, 0.5)' : `1px solid ${colors.userBubbleBorder}`,
         borderRadius: '14px 14px 4px 14px',
-        whiteSpace: 'pre-wrap',
       }}
     >
-      {displayContent}
+      <div className="prose-cloud prose-cloud-user">
+        <Markdown remarkPlugins={REMARK_PLUGINS} components={userMarkdownComponents}>
+          {displayContent}
+        </Markdown>
+      </div>
       {hasAttachments && <MessageAttachments attachments={message.attachments!} />}
     </div>
   )
