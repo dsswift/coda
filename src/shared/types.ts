@@ -379,6 +379,7 @@ export const IPC = {
   PASTE_IMAGE: 'coda:paste-image',
   GET_DIAGNOSTICS: 'coda:get-diagnostics',
   RESPOND_PERMISSION: 'coda:respond-permission',
+  APPROVE_DENIED_TOOLS: 'coda:approve-denied-tools',
   INIT_SESSION: 'coda:init-session',
   RESET_TAB_SESSION: 'coda:reset-tab-session',
   ANIMATE_HEIGHT: 'coda:animate-height',
@@ -541,7 +542,9 @@ export interface PersistedTabState {
   editorStates?: Record<string, PersistedEditorState>
   /** Whether the conversation view was expanded */
   isExpanded?: boolean
-  /** Indices into tabs array for tabs that had the file editor open */
+  /** Directories that had the file editor open */
+  editorOpenDirs?: string[]
+  /** @deprecated Indices into tabs array for tabs that had the file editor open */
   editorOpenSessionIds?: number[]
   /** Global file editor window position and size */
   editorGeometry?: { x: number; y: number; w: number; h: number }
