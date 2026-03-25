@@ -117,6 +117,18 @@ export interface UnknownEvent {
   [key: string]: unknown
 }
 
+// ─── Tab Grouping ───
+
+export type TabGroupMode = 'off' | 'auto' | 'manual'
+
+export interface TabGroup {
+  id: string          // nanoid
+  label: string       // user-provided name (manual) or dir name (auto)
+  isDefault: boolean  // manual mode: where new tabs land
+  order: number       // position in strip
+  collapsed: boolean  // whether the group shows as a single pill
+}
+
 // ─── Tab State Machine (v2 — from execution plan) ───
 
 export type TabStatus = 'connecting' | 'idle' | 'running' | 'completed' | 'failed' | 'dead'
@@ -153,6 +165,7 @@ export type Attachment = FileAttachment | PlanAttachment
 export interface TabState {
   id: string
   claudeSessionId: string | null
+  historicalSessionIds: string[]
   status: TabStatus
   activeRequestId: string | null
   hasUnread: boolean
@@ -193,10 +206,14 @@ export interface TabState {
   bashExecId: string | null
   /** Custom pill outline color (null = use theme default) */
   pillColor: string | null
+  /** Session ID this tab was forked from (null if not a fork) */
+  forkedFromSessionId: string | null
   /** Worktree metadata when tab operates inside a managed worktree */
   worktree: WorktreeInfo | null
   /** True while waiting for the user to pick a source branch in the BranchPickerDialog */
   pendingWorktreeSetup: boolean
+  /** Tab group assignment (null = ungrouped / auto-computed) */
+  groupId: string | null
 }
 
 export interface Message {
@@ -258,6 +275,8 @@ export interface RunOptions {
   addDirs?: string[]
   /** CLI permission mode override (e.g. 'plan') passed as --permission-mode */
   permissionModeCli?: string
+  /** Extra context appended to the system prompt (additive, not replacement) */
+  appendSystemPrompt?: string
 }
 
 // ─── Control Plane Types ───
@@ -304,6 +323,7 @@ export interface SessionMeta {
   lastResponse: string | null
   lastTimestamp: string
   size: number
+  customTitle: string | null
 }
 
 export interface SessionLoadMessage {
@@ -414,6 +434,10 @@ export const IPC = {
   LOAD_TABS: 'coda:load-tabs',
   SAVE_TABS: 'coda:save-tabs',
 
+  // Session labels
+  SAVE_SESSION_LABEL: 'coda:save-session-label',
+  LOAD_SESSION_LABELS: 'coda:load-session-labels',
+
   // Git operations
   GIT_GRAPH: 'coda:git-graph',
   GIT_CHANGES: 'coda:git-changes',
@@ -478,6 +502,7 @@ export const IPC = {
 
 export interface PersistedTab {
   claudeSessionId: string | null
+  historicalSessionIds?: string[]
   title: string
   customTitle: string | null
   workingDirectory: string
@@ -486,7 +511,9 @@ export interface PersistedTab {
   permissionMode: 'ask' | 'auto' | 'plan'
   bashResults?: Array<{ command: string; stdout: string; stderr: string }>
   pillColor?: string | null
+  forkedFromSessionId?: string | null
   worktree?: WorktreeInfo | null
+  groupId?: string | null
 }
 
 export interface PersistedEditorFile {

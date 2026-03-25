@@ -27,6 +27,8 @@ function formatSize(bytes: number): string {
 
 export function HistoryPicker() {
   const resumeSession = useSessionStore((s) => s.resumeSession)
+  const selectTab = useSessionStore((s) => s.selectTab)
+  const tabs = useSessionStore((s) => s.tabs)
   const isExpanded = useSessionStore((s) => s.isExpanded)
   const activeTab = useSessionStore(
     (s) => s.tabs.find((t) => t.id === s.activeTabId),
@@ -97,10 +99,20 @@ export function HistoryPicker() {
 
   const handleSelect = (session: SessionMeta) => {
     setOpen(false)
-    const title = session.firstMessage
-      ? (session.firstMessage.length > 30 ? session.firstMessage.substring(0, 27) + '...' : session.firstMessage)
-      : session.slug || 'Resumed'
-    void resumeSession(session.sessionId, title, effectiveProjectPath)
+    // If this session is already open in a tab, switch to it instead of duplicating
+    const existingTab = tabs.find((t) =>
+      t.claudeSessionId === session.sessionId
+      || t.historicalSessionIds.includes(session.sessionId)
+    )
+    if (existingTab) {
+      selectTab(existingTab.id)
+      return
+    }
+    const title = session.customTitle
+      || (session.firstMessage
+        ? (session.firstMessage.length > 30 ? session.firstMessage.substring(0, 27) + '...' : session.firstMessage)
+        : session.slug || 'Resumed')
+    void resumeSession(session.sessionId, title, effectiveProjectPath, session.customTitle)
   }
 
   return (
@@ -159,18 +171,29 @@ export function HistoryPicker() {
               </div>
             )}
 
-            {!loading && sessions.map((session) => (
+            {!loading && sessions.map((session) => {
+              const isOpen = tabs.some((t) =>
+                t.claudeSessionId === session.sessionId
+                || t.historicalSessionIds.includes(session.sessionId)
+              )
+              return (
               <button
                 key={session.sessionId}
                 onClick={() => handleSelect(session)}
                 className="w-full flex items-start gap-2.5 px-3 py-2 text-left transition-colors"
+                style={isOpen ? { opacity: 0.5 } : undefined}
               >
                 <ChatCircle size={13} className="flex-shrink-0 mt-0.5" style={{ color: colors.textTertiary }} />
                 <div className="min-w-0 flex-1">
                   <div className="text-[11px] truncate" style={{ color: colors.textPrimary }}>
-                    {session.firstMessage || session.slug || session.sessionId.substring(0, 8)}
+                    {session.customTitle || session.firstMessage || session.slug || session.sessionId.substring(0, 8)}
                   </div>
-                  {session.lastResponse && (
+                  {session.customTitle && session.firstMessage && (
+                    <div className="text-[10px] truncate mt-0.5" style={{ color: colors.textSecondary, opacity: 0.7 }}>
+                      {session.firstMessage}
+                    </div>
+                  )}
+                  {!session.customTitle && session.lastResponse && (
                     <div className="text-[10px] truncate mt-0.5" style={{ color: colors.textSecondary, opacity: 0.7 }}>
                       {session.lastResponse}
                     </div>
@@ -179,10 +202,12 @@ export function HistoryPicker() {
                     <span>{formatTimeAgo(session.lastTimestamp)}</span>
                     <span>{formatSize(session.size)}</span>
                     {session.slug && <span className="truncate">{session.slug}</span>}
+                    {isOpen && <span style={{ color: colors.textSecondary }}>open</span>}
                   </div>
                 </div>
               </button>
-            ))}
+              )
+            })}
           </div>
         </motion.div>,
         popoverLayer,

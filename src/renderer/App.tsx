@@ -1,4 +1,5 @@
 import React, { useEffect, useCallback, useState } from 'react'
+import type { Message } from '../shared/types'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Paperclip, Camera, HeadCircuit } from '@phosphor-icons/react'
 import { GitPanel } from './components/GitPanel'
@@ -201,6 +202,7 @@ export default function App() {
                       bashResults: st.bashResults || [],
                       pillColor: st.pillColor || null,
                       worktree: restoredWorktree,
+                      historicalSessionIds: st.historicalSessionIds || [],
                       // If worktree was cleaned up, fall back to original repo path
                       ...(st.worktree && !restoredWorktree ? { workingDirectory: st.worktree.repoPath } : {}),
                     }
@@ -222,11 +224,49 @@ export default function App() {
                       additionalDirs: st.additionalDirs,
                       permissionMode: st.permissionMode,
                       pillColor: st.pillColor || null,
+                      forkedFromSessionId: st.forkedFromSessionId || null,
                       worktree: st.worktree || null,
+                      historicalSessionIds: st.historicalSessionIds || [],
+                      groupId: st.groupId || null,
                     }
                   : t
               ),
             }))
+          }
+        }
+
+        // Load historical session messages for tabs that have them
+        for (const { tabId, index } of restoredTabIds) {
+          const st = saved.tabs[index]
+          const historicalIds = st.historicalSessionIds || []
+          if (historicalIds.length > 0) {
+            const allHistoricalMessages: Message[] = []
+            for (const hid of historicalIds) {
+              const history = await window.coda.loadSession(hid, st.workingDirectory).catch(() => [])
+              const msgs = history.map((m) => ({
+                id: crypto.randomUUID(),
+                role: m.role as Message['role'],
+                content: m.content,
+                toolName: m.toolName,
+                toolId: m.toolId,
+                toolInput: m.toolInput,
+                toolStatus: m.toolName ? 'completed' as const : undefined,
+                userExecuted: m.userExecuted,
+                attachments: m.attachments,
+                timestamp: m.timestamp,
+              }))
+              allHistoricalMessages.push(...msgs)
+            }
+
+            if (allHistoricalMessages.length > 0) {
+              useSessionStore.setState((s) => ({
+                tabs: s.tabs.map((t) =>
+                  t.id === tabId
+                    ? { ...t, messages: [...allHistoricalMessages, ...t.messages] }
+                    : t
+                ),
+              }))
+            }
           }
         }
 
@@ -485,6 +525,7 @@ export default function App() {
   }, [])
 
   const isExpanded = useSessionStore((s) => s.isExpanded)
+  const isTallView = useSessionStore((s) => s.tallViewTabId === s.activeTabId)
   const marketplaceOpen = useSessionStore((s) => s.marketplaceOpen)
   const gitPanelOpen = useSessionStore((s) => s.gitPanelOpen)
   const activeTabId = useSessionStore((s) => s.activeTabId)
@@ -514,7 +555,18 @@ export default function App() {
   const cardExpandedWidth = expandedUI ? 700 : 460
   const cardCollapsedWidth = expandedUI ? 670 : 430
   const cardCollapsedMargin = expandedUI ? 15 : 15
-  const bodyMaxHeight = expandedUI ? 520 : 400
+  const bodyMaxHeightNormal = expandedUI ? 520 : 400
+
+  // Dynamic window height for tall view
+  const [winHeight, setWinHeight] = useState(window.innerHeight)
+  useEffect(() => {
+    const onResize = () => setWinHeight(window.innerHeight)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  // In tall view: fill available vertical space (minus tab strip, status bar, input bar, margins)
+  const bodyMaxHeight = isTallView ? winHeight - 200 : bodyMaxHeightNormal
 
   const handleMainUIMouseDown = useCallback(() => {
     if (useSessionStore.getState().fileEditorFocused) {
@@ -594,9 +646,9 @@ export default function App() {
             />
           )}
 
-          {/* ─── Terminal panel ─── */}
+          {/* ─── Terminal panel (hidden in tall view) ─── */}
           <AnimatePresence initial={false}>
-            {terminalOpen && (
+            {terminalOpen && !isTallView && (
               <motion.div
                 data-coda-ui
                 initial={{ opacity: 0, height: 0 }}
