@@ -216,6 +216,8 @@ export interface TabState {
   pendingWorktreeSetup: boolean
   /** Tab group assignment (null = ungrouped / auto-computed) */
   groupId: string | null
+  /** Latest input_tokens from API response (total context sent to model) */
+  contextTokens: number | null
 }
 
 export interface Message {
@@ -326,6 +328,12 @@ export interface SessionMeta {
   lastTimestamp: string
   size: number
   customTitle: string | null
+  /** Decoded real filesystem path (null if directory no longer exists) */
+  projectPath: string | null
+  /** Human-readable label (basename of path, or fallback from encoded name) */
+  projectLabel: string | null
+  /** Raw encoded directory name under ~/.claude/projects/ (for loading sessions from deleted dirs) */
+  encodedDir: string | null
 }
 
 export interface SessionLoadMessage {
@@ -386,6 +394,7 @@ export const IPC = {
   RESET_TAB_SESSION: 'coda:reset-tab-session',
   ANIMATE_HEIGHT: 'coda:animate-height',
   LIST_SESSIONS: 'coda:list-sessions',
+  LIST_ALL_SESSIONS: 'coda:list-all-sessions',
   LOAD_SESSION: 'coda:load-session',
   READ_PLAN: 'coda:read-plan',
 
