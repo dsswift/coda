@@ -7,6 +7,7 @@ import remarkGfm from 'remark-gfm'
 // Editor portals to document.body (not PopoverLayer) so z-index can go behind main UI
 import { useColors, useThemeStore } from '../theme'
 import { useSessionStore, FileEditorTab } from '../stores/sessionStore'
+import { EDITABLE_EXTS } from '../hooks/useNavigableLinks'
 
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightSpecialChars } from '@codemirror/view'
 import { EditorState, Extension } from '@codemirror/state'
@@ -392,13 +393,37 @@ export function FileEditor({ dir, tabId }: FileEditorProps) {
         className="underline decoration-dotted underline-offset-2 cursor-pointer"
         style={{ color: colors.accent }}
         onClick={() => {
-          if (href) window.coda.openExternal(String(href))
+          if (!href) return
+          const h = String(href)
+          // URLs open in native browser
+          if (h.startsWith('http://') || h.startsWith('https://')) {
+            window.coda.openExternal(h)
+            return
+          }
+          // Resolve relative path against current file's directory
+          const baseDir = activeFile?.filePath
+            ? activeFile.filePath.replace(/\/[^/]+$/, '')
+            : dir
+          // Normalize: join baseDir + href, then collapse ../ and ./
+          const parts = (baseDir + '/' + h).split('/')
+          const resolved: string[] = []
+          for (const p of parts) {
+            if (p === '..') resolved.pop()
+            else if (p && p !== '.') resolved.push(p)
+          }
+          const fullPath = '/' + resolved.join('/')
+          const ext = fullPath.includes('.') ? '.' + fullPath.split('.').pop()!.toLowerCase() : ''
+          if (EDITABLE_EXTS.has(ext)) {
+            useSessionStore.getState().openFileInEditor(dir, tabId, fullPath, { insertAfterActive: true })
+          } else {
+            window.coda.openExternal(h)
+          }
         }}
       >
         {children}
       </button>
     ),
-  }), [colors])
+  }), [colors, activeFile?.filePath, dir, tabId])
 
   if (typeof document === 'undefined') return null
 
@@ -665,6 +690,17 @@ interface TabItemProps {
 }
 
 function TabItem({ file, isActive, colors, onSelect, onClose }: TabItemProps) {
+  const [confirmingClose, setConfirmingClose] = useState(false)
+
+  const handleClose = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (file.isDirty) {
+      setConfirmingClose(true)
+    } else {
+      onClose(e)
+    }
+  }
+
   return (
     <div
       className="flex items-center gap-1.5 px-2 cursor-pointer transition-colors"
@@ -678,35 +714,56 @@ function TabItem({ file, isActive, colors, onSelect, onClose }: TabItemProps) {
         whiteSpace: 'nowrap',
       }}
       onClick={onSelect}
-      onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); onClose(e) } }}
+      onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); handleClose(e) } }}
     >
       <span style={{ fontStyle: file.filePath === null ? 'italic' : 'normal' }}>
         {file.fileName}
       </span>
-      {file.isDirty && (
-        <span
-          style={{
-            display: 'inline-block',
-            width: 5,
-            height: 5,
-            borderRadius: '50%',
-            backgroundColor: colors.accent,
-            flexShrink: 0,
-          }}
-        />
+      {confirmingClose ? (
+        <div className="flex items-center gap-0.5 text-[9px] flex-shrink-0" onClick={(e) => e.stopPropagation()}>
+          <button
+            onClick={() => setConfirmingClose(false)}
+            className="px-1 rounded"
+            style={{ color: colors.textTertiary, background: 'none', border: 'none', cursor: 'pointer' }}
+          >
+            No
+          </button>
+          <button
+            onClick={(e) => { onClose(e); setConfirmingClose(false) }}
+            className="px-1 rounded"
+            style={{ color: colors.accent, background: 'none', border: 'none', cursor: 'pointer' }}
+          >
+            Yes
+          </button>
+        </div>
+      ) : (
+        <>
+          {file.isDirty && (
+            <span
+              style={{
+                display: 'inline-block',
+                width: 5,
+                height: 5,
+                borderRadius: '50%',
+                backgroundColor: colors.accent,
+                flexShrink: 0,
+              }}
+            />
+          )}
+          <button
+            className="flex items-center justify-center rounded p-0.5 transition-colors"
+            style={{
+              color: colors.textTertiary,
+              cursor: 'pointer',
+              opacity: 0.6,
+              flexShrink: 0,
+            }}
+            onClick={handleClose}
+          >
+            <X size={10} />
+          </button>
+        </>
       )}
-      <button
-        className="flex items-center justify-center rounded p-0.5 transition-colors"
-        style={{
-          color: colors.textTertiary,
-          cursor: 'pointer',
-          opacity: 0.6,
-          flexShrink: 0,
-        }}
-        onClick={onClose}
-      >
-        <X size={10} />
-      </button>
     </div>
   )
 }

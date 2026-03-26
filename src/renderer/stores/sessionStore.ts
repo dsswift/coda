@@ -91,6 +91,9 @@ interface State {
   /** Which tab (if any) is in ephemeral tall view (null = normal) */
   tallViewTabId: string | null
 
+  /** Incremented on every sendMessage to force ConversationView scroll-to-bottom */
+  scrollToBottomCounter: number
+
   // Settings dialog state
   settingsOpen: boolean
 
@@ -132,7 +135,7 @@ interface State {
   toggleFileEditor: (tabId: string) => void
   focusFileEditor: () => void
   blurFileEditor: () => void
-  openFileInEditor: (dir: string, tabId: string, filePath: string) => void
+  openFileInEditor: (dir: string, tabId: string, filePath: string, opts?: { insertAfterActive?: boolean }) => void
   closeFileEditorTab: (dir: string, fileId: string) => void
   setActiveEditorFile: (dir: string, fileId: string) => void
   createScratchFile: (dir: string) => void
@@ -252,6 +255,8 @@ export const useSessionStore = create<State>((set, get) => ({
   tabsReady: false,
 
   tallViewTabId: null,
+
+  scrollToBottomCounter: 0,
 
   // Settings dialog
   settingsOpen: false,
@@ -573,7 +578,7 @@ export const useSessionStore = create<State>((set, get) => ({
   focusFileEditor: () => set({ fileEditorFocused: true }),
   blurFileEditor: () => set({ fileEditorFocused: false }),
 
-  openFileInEditor: (dir, tabId, filePath) => {
+  openFileInEditor: (dir, tabId, filePath, opts) => {
     const { closeExplorerOnFileOpen, openMarkdownInPreview } = useThemeStore.getState()
     set((s) => {
       const states = new Map(s.fileEditorStates)
@@ -597,7 +602,14 @@ export const useSessionStore = create<State>((set, get) => ({
           isReadOnly: !isEditableByDefault(fileName),
           isPreview: isMd && openMarkdownInPreview,
         }
-        states.set(dir, { activeFileId: id, files: [...current.files, newFile] })
+        if (opts?.insertAfterActive) {
+          const activeIdx = current.files.findIndex(f => f.id === current.activeFileId)
+          const files = [...current.files]
+          files.splice(activeIdx + 1, 0, newFile)
+          states.set(dir, { activeFileId: id, files })
+        } else {
+          states.set(dir, { activeFileId: id, files: [...current.files, newFile] })
+        }
       }
       // Also make editor visible for this directory
       const editorOpen = new Set(s.fileEditorOpenDirs)
@@ -1492,6 +1504,7 @@ export const useSessionStore = create<State>((set, get) => ({
     // Optimistic update: clear attachments
     // If busy, add to queuedPrompts (shown at bottom); otherwise add to messages and set connecting
     set((s) => ({
+      scrollToBottomCounter: s.scrollToBottomCounter + 1,
       tabs: s.tabs.map((t) => {
         if (t.id !== activeTabId) return t
         const withEffectiveBase = t.hasChosenDirectory
