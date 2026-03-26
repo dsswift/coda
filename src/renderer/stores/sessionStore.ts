@@ -150,6 +150,8 @@ interface State {
   uninstallMarketplacePlugin: (plugin: CatalogPlugin) => Promise<void>
   buildYourOwn: () => void
   forkTab: (sourceTabId: string) => Promise<string | null>
+  rewindToMessage: (tabId: string, messageId: string) => void
+  forkFromMessage: (tabId: string, messageId: string) => Promise<string | null>
   resumeSession: (sessionId: string, title?: string, projectPath?: string, customTitle?: string | null) => Promise<string>
   addSystemMessage: (content: string) => void
   startBashCommand: (command: string, execId: string) => { toolMsgId: string; tabId: string }
@@ -928,10 +930,10 @@ export const useSessionStore = create<State>((set, get) => ({
         id: nextMsgId(),
       }))
 
-      // Restore plan-ready state if last tool message was ExitPlanMode
+      // Restore plan-ready / ask-user state if last tool message needs user response
       const lastToolMsg = [...messages].reverse().find((m) => m.toolName)
-      const restoredDenied = lastToolMsg?.toolName === 'ExitPlanMode'
-        ? { tools: [{ toolName: 'ExitPlanMode', toolUseId: 'restored' }] }
+      const restoredDenied = (lastToolMsg?.toolName === 'ExitPlanMode' || lastToolMsg?.toolName === 'AskUserQuestion')
+        ? { tools: [{ toolName: lastToolMsg.toolName, toolUseId: 'restored' }] }
         : null
 
       const tab: TabState = {
@@ -961,6 +963,90 @@ export const useSessionStore = create<State>((set, get) => ({
     }
   },
 
+  rewindToMessage: (tabId, messageId) => {
+    const tab = get().tabs.find((t) => t.id === tabId)
+    if (!tab) return
+    const idx = tab.messages.findIndex((m) => m.id === messageId)
+    if (idx < 0) return
+
+    const oldSessionId = tab.claudeSessionId
+    const historicalSessionIds = oldSessionId
+      ? [...tab.historicalSessionIds, oldSessionId]
+      : [...tab.historicalSessionIds]
+
+    const rewoundMessages = tab.messages.slice(0, idx + 1)
+    const lastToolMsg = [...rewoundMessages].reverse().find((m) => m.toolName)
+    const restoredDenied = (lastToolMsg?.toolName === 'ExitPlanMode' || lastToolMsg?.toolName === 'AskUserQuestion')
+      ? { tools: [{ toolName: lastToolMsg.toolName, toolUseId: 'restored' }] }
+      : null
+
+    window.coda.resetTabSession(tabId)
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId
+          ? {
+              ...t,
+              messages: rewoundMessages,
+              claudeSessionId: null,
+              historicalSessionIds,
+              forkedFromSessionId: oldSessionId,
+              lastResult: null,
+              currentActivity: '',
+              permissionQueue: [],
+              permissionDenied: restoredDenied,
+              queuedPrompts: [],
+            }
+          : t
+      ),
+    }))
+  },
+
+  forkFromMessage: async (tabId, messageId) => {
+    const source = get().tabs.find((t) => t.id === tabId)
+    if (!source) return null
+    const idx = source.messages.findIndex((m) => m.id === messageId)
+    if (idx < 0) return null
+
+    try {
+      const { tabId: newTabId } = await window.coda.createTab()
+      const messages: Message[] = source.messages.slice(0, idx + 1).map((m) => ({
+        ...m,
+        id: nextMsgId(),
+      }))
+
+      // Restore plan-ready / ask-user state if last tool message needs user response
+      const lastToolMsg = [...messages].reverse().find((m) => m.toolName)
+      const restoredDenied = (lastToolMsg?.toolName === 'ExitPlanMode' || lastToolMsg?.toolName === 'AskUserQuestion')
+        ? { tools: [{ toolName: lastToolMsg.toolName, toolUseId: 'restored' }] }
+        : null
+
+      const tab: TabState = {
+        ...makeLocalTab(),
+        id: newTabId,
+        claudeSessionId: null,
+        forkedFromSessionId: source.claudeSessionId,
+        title: source.title,
+        customTitle: source.customTitle,
+        workingDirectory: source.workingDirectory,
+        hasChosenDirectory: source.hasChosenDirectory,
+        additionalDirs: [...source.additionalDirs],
+        permissionMode: source.permissionMode,
+        pillColor: source.pillColor,
+        messages,
+        permissionDenied: restoredDenied,
+      }
+      set((s) => ({
+        tabs: [...s.tabs, tab],
+        activeTabId: tab.id,
+        isExpanded: true,
+      }))
+      window.coda.setPermissionMode(newTabId, tab.permissionMode)
+      return newTabId
+    } catch {
+      return null
+    }
+  },
+
   resumeSession: async (sessionId, title, projectPath, customTitle) => {
     const defaultDir = projectPath || get().staticInfo?.homePath || '~'
     try {
@@ -981,10 +1067,10 @@ export const useSessionStore = create<State>((set, get) => ({
         timestamp: m.timestamp,
       }))
 
-      // Restore plan-ready state if last tool message was ExitPlanMode
+      // Restore plan-ready / ask-user state if last tool message needs user response
       const lastToolMsg = [...messages].reverse().find((m) => m.toolName)
-      const restoredDenied = lastToolMsg?.toolName === 'ExitPlanMode'
-        ? { tools: [{ toolName: 'ExitPlanMode', toolUseId: 'restored' }] }
+      const restoredDenied = (lastToolMsg?.toolName === 'ExitPlanMode' || lastToolMsg?.toolName === 'AskUserQuestion')
+        ? { tools: [{ toolName: lastToolMsg.toolName, toolUseId: 'restored' }] }
         : null
 
       const tab: TabState = {
@@ -1492,6 +1578,7 @@ export const useSessionStore = create<State>((set, get) => ({
             if (!event.isWarmup) {
               updated.status = 'running'
               updated.currentActivity = 'Thinking...'
+              updated.permissionDenied = null
               // Move the first queued prompt into the timeline (it's now being processed)
               if (updated.queuedPrompts.length > 0) {
                 const [nextPrompt, ...rest] = updated.queuedPrompts
