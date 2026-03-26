@@ -139,6 +139,14 @@ function createWindow(): void {
   mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
   mainWindow.setAlwaysOnTop(true, 'screen-saver')
 
+  // Log renderer crashes and errors for diagnostics
+  mainWindow.webContents.on('console-message', (_e, level, message) => {
+    if (level >= 2) log(`[renderer:error] ${message}`)
+  })
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    log(`[renderer:gone] reason=${details.reason} exitCode=${details.exitCode}`)
+  })
+
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show()
     // Enable OS-level click-through for transparent regions.
@@ -648,14 +656,187 @@ ipcMain.handle(IPC.LIST_SESSIONS, async (_e, projectPath?: string) => {
     sessions.sort((a, b) => new Date(b.lastTimestamp).getTime() - new Date(a.lastTimestamp).getTime())
     const top = sessions.slice(0, 20)
 
-    // Merge in persisted custom titles
+    // Merge in persisted custom titles and add project fields
     const labels = loadSessionLabels()
     for (const s of top) {
       (s as any).customTitle = labels[s.sessionId] || null
+      ;(s as any).projectPath = null
+      ;(s as any).projectLabel = null
+      ;(s as any).encodedDir = null
     }
     return top
   } catch (err) {
     log(`LIST_SESSIONS error: ${err}`)
+    return []
+  }
+})
+
+// ─── Path Decoder ───
+// Claude encodes project paths by replacing '/' with '-'. Since paths can contain
+// hyphens, the encoding is ambiguous. We resolve by greedy filesystem walking.
+function decodeProjectPath(encoded: string): string | null {
+  // Encoded always starts with '-' (from leading '/'), strip it
+  if (!encoded.startsWith('-')) return null
+  const segments = encoded.slice(1).split('-')
+  if (segments.length === 0) return null
+
+  let current = '/'
+  let i = 0
+  while (i < segments.length) {
+    // Try progressively longer hyphen-joined segments (greedy)
+    let matched = false
+    for (let end = segments.length; end > i; end--) {
+      const candidate = segments.slice(i, end).join('-')
+      const testPath = join(current, candidate)
+      try {
+        if (existsSync(testPath) && statSync(testPath).isDirectory()) {
+          current = testPath
+          i = end
+          matched = true
+          break
+        }
+      } catch {}
+    }
+    if (!matched) return null
+  }
+  return current
+}
+
+// ─── Shared Session Metadata Parser ───
+interface ParsedSessionMeta {
+  sessionId: string
+  slug: string | null
+  firstMessage: string | null
+  lastResponse: string | null
+  lastTimestamp: string
+  size: number
+}
+
+async function parseSessionMeta(filePath: string, fileSessionId: string, fileSize: number, fileMtime: Date): Promise<ParsedSessionMeta | null> {
+  const meta = { validated: false, slug: null as string | null, firstMessage: null as string | null, lastResponse: null as string | null, lastTimestamp: null as string | null }
+
+  await new Promise<void>((resolve) => {
+    const rl = createInterface({ input: createReadStream(filePath) })
+    rl.on('line', (line: string) => {
+      try {
+        const obj = JSON.parse(line)
+        if (!meta.validated && obj.type && obj.uuid && obj.timestamp) meta.validated = true
+        if (obj.slug && !meta.slug) meta.slug = obj.slug
+        if (obj.timestamp) meta.lastTimestamp = obj.timestamp
+        if (obj.type === 'user' && !meta.firstMessage) {
+          const content = obj.message?.content
+          let raw = ''
+          if (typeof content === 'string') raw = content
+          else if (Array.isArray(content)) raw = (content.find((p: any) => p.type === 'text')?.text) || ''
+          if (!raw || raw.includes('<local-command-caveat') || raw.includes('<bash-stdout') || raw.includes('<bash-stderr') || raw.includes('<system-reminder') || raw.includes('<command-name')) {
+            // Skip internal
+          } else if (raw.includes('<bash-input')) {
+            const cmd = extractTag(raw, 'bash-input')
+            if (cmd) meta.firstMessage = `! ${cmd.trim()}`.substring(0, 100)
+          } else {
+            const cleaned = cleanCliTags(raw)
+            const { bashEntries, remainder } = extractBashEntries(cleaned)
+            if (bashEntries.length > 0) meta.firstMessage = `! ${bashEntries[0].command}`.substring(0, 100)
+            else meta.firstMessage = cleaned.substring(0, 100) || null
+          }
+        }
+        if (obj.type === 'assistant') {
+          const content = obj.message?.content
+          let raw = ''
+          if (typeof content === 'string') raw = content
+          else if (Array.isArray(content)) raw = (content.find((p: any) => p.type === 'text')?.text) || ''
+          if (raw) {
+            const cleaned = cleanCliTags(raw).substring(0, 100)
+            if (cleaned) meta.lastResponse = cleaned
+          }
+        }
+      } catch {}
+    })
+    rl.on('close', () => resolve())
+  })
+
+  if (!meta.validated) return null
+  return {
+    sessionId: fileSessionId,
+    slug: meta.slug,
+    firstMessage: meta.firstMessage,
+    lastResponse: meta.lastResponse,
+    lastTimestamp: meta.lastTimestamp || fileMtime.toISOString(),
+    size: fileSize,
+  }
+}
+
+// ─── LIST_ALL_SESSIONS: scan all directories under ~/.claude/projects/ ───
+ipcMain.handle(IPC.LIST_ALL_SESSIONS, async () => {
+  log('IPC LIST_ALL_SESSIONS')
+  try {
+    const projectsRoot = join(homedir(), '.claude', 'projects')
+    if (!existsSync(projectsRoot)) return []
+
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+    // Phase 1: stat only — collect all session files with mtime
+    const candidates: Array<{ encodedDir: string; sessionId: string; mtime: number; size: number; filePath: string }> = []
+    const dirs = readdirSync(projectsRoot)
+
+    for (const encodedDir of dirs) {
+      const dirPath = join(projectsRoot, encodedDir)
+      try {
+        if (!statSync(dirPath).isDirectory()) continue
+      } catch { continue }
+
+      const files = readdirSync(dirPath).filter((f: string) => f.endsWith('.jsonl'))
+      for (const file of files) {
+        const sessionId = file.replace(/\.jsonl$/, '')
+        if (!UUID_RE.test(sessionId)) continue
+        const fp = join(dirPath, file)
+        try {
+          const st = statSync(fp)
+          if (st.size < 100) continue
+          candidates.push({ encodedDir, sessionId, mtime: st.mtime.getTime(), size: st.size, filePath: fp })
+        } catch { continue }
+      }
+    }
+
+    // Sort by mtime descending, take top 50
+    candidates.sort((a, b) => b.mtime - a.mtime)
+    const top = candidates.slice(0, 50)
+
+    // Phase 2: parse metadata for top 50 and decode paths
+    const labels = loadSessionLabels()
+    const pathCache = new Map<string, string | null>()
+    const sessions: Array<{ sessionId: string; slug: string | null; firstMessage: string | null; lastResponse: string | null; lastTimestamp: string; size: number; customTitle: string | null; projectPath: string | null; projectLabel: string | null; encodedDir: string }> = []
+
+    for (const c of top) {
+      const parsed = await parseSessionMeta(c.filePath, c.sessionId, c.size, new Date(c.mtime))
+      if (!parsed) continue
+
+      // Decode project path (cached per encodedDir)
+      let projectPath: string | null
+      if (pathCache.has(c.encodedDir)) {
+        projectPath = pathCache.get(c.encodedDir)!
+      } else {
+        projectPath = decodeProjectPath(c.encodedDir)
+        pathCache.set(c.encodedDir, projectPath)
+      }
+
+      const projectLabel = projectPath
+        ? basename(projectPath)
+        : c.encodedDir.split('-').filter(Boolean).pop() || c.encodedDir
+
+      sessions.push({
+        ...parsed,
+        customTitle: labels[parsed.sessionId] || null,
+        projectPath,
+        projectLabel,
+        encodedDir: c.encodedDir,
+      })
+    }
+
+    log(`LIST_ALL_SESSIONS: found ${sessions.length} sessions across ${pathCache.size} directories`)
+    return sessions
+  } catch (err) {
+    log(`LIST_ALL_SESSIONS error: ${err}`)
     return []
   }
 })
@@ -700,22 +881,29 @@ function extractBashEntries(text: string): { bashEntries: Array<{ command: strin
   return { bashEntries: entries, remainder: rest }
 }
 
-ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPath?: string } | string) => {
+ipcMain.handle(IPC.LOAD_SESSION, async (_e, arg: { sessionId: string; projectPath?: string; encodedDir?: string } | string) => {
   const sessionId = typeof arg === 'string' ? arg : arg.sessionId
   const projectPath = typeof arg === 'string' ? undefined : arg.projectPath
-  log(`IPC LOAD_SESSION ${sessionId}${projectPath ? ` (path=${projectPath})` : ''}`)
+  const encodedDir = typeof arg === 'string' ? undefined : arg.encodedDir
+  log(`IPC LOAD_SESSION ${sessionId}${projectPath ? ` (path=${projectPath})` : ''}${encodedDir ? ` (encodedDir=${encodedDir})` : ''}`)
   try {
     if (!isValidSessionId(sessionId)) {
       log(`LOAD_SESSION: rejected invalid sessionId: ${sessionId}`)
       return []
     }
-    const cwd = projectPath || process.cwd()
-    if (!isValidProjectPath(cwd)) {
-      log(`LOAD_SESSION: rejected invalid projectPath: ${cwd}`)
-      return []
+    // When encodedDir is provided (from global history), use it directly
+    let filePath: string
+    if (encodedDir) {
+      filePath = join(homedir(), '.claude', 'projects', encodedDir, `${sessionId}.jsonl`)
+    } else {
+      const cwd = projectPath || process.cwd()
+      if (!isValidProjectPath(cwd)) {
+        log(`LOAD_SESSION: rejected invalid projectPath: ${cwd}`)
+        return []
+      }
+      const encodedPath = cwd.replace(/\//g, '-')
+      filePath = join(homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)
     }
-    const encodedPath = cwd.replace(/\//g, '-')
-    const filePath = join(homedir(), '.claude', 'projects', encodedPath, `${sessionId}.jsonl`)
     if (!existsSync(filePath)) return []
 
     const messages: Array<{ role: string; content: string; toolName?: string; toolInput?: string; toolId?: string; userExecuted?: boolean; attachments?: Array<{ id: string; type: string; name: string; path: string; mimeType?: string }>; timestamp: number }> = []
@@ -914,14 +1102,12 @@ ipcMain.handle(IPC.READ_PLAN, async (_e, filePath: string) => {
 
 ipcMain.handle(IPC.SELECT_DIRECTORY, async () => {
   if (!mainWindow) return null
-  // macOS: activate app so unparented dialog appears on top (not behind other apps).
-  // Unparented avoids modal dimming on the transparent overlay.
-  // Activation is fine here — user is actively interacting with CODA.
-  if (process.platform === 'darwin') app.focus()
+  mainWindow.hide()
   const options = { properties: ['openDirectory' as const] }
   const result = process.platform === 'darwin'
     ? await dialog.showOpenDialog(options)
     : await dialog.showOpenDialog(mainWindow, options)
+  showWindow('dialog-return')
   return result.canceled ? null : result.filePaths[0]
 })
 
@@ -938,8 +1124,7 @@ ipcMain.handle(IPC.OPEN_EXTERNAL, async (_event, url: string) => {
 
 ipcMain.handle(IPC.ATTACH_FILES, async () => {
   if (!mainWindow) return null
-  // macOS: activate app so unparented dialog appears on top
-  if (process.platform === 'darwin') app.focus()
+  mainWindow.hide()
   // macOS NSOpenPanel doesn't reliably handle extensions: ['*'] — omit filters
   // so all files are selectable. Other platforms get type filter dropdowns.
   const options: Electron.OpenDialogOptions = {
@@ -955,6 +1140,7 @@ ipcMain.handle(IPC.ATTACH_FILES, async () => {
   const result = process.platform === 'darwin'
     ? await dialog.showOpenDialog(options)
     : await dialog.showOpenDialog(mainWindow, options)
+  showWindow('dialog-return')
   if (result.canceled || result.filePaths.length === 0) return null
 
   const { basename, extname } = require('path')
@@ -2010,7 +2196,9 @@ ipcMain.handle(IPC.FS_DELETE, async (_event, { targetPath }: { targetPath: strin
 
 ipcMain.handle(IPC.FS_SAVE_DIALOG, async (_event, { defaultPath }: { defaultPath?: string }) => {
   if (!mainWindow) return { filePath: null }
+  mainWindow.hide()
   const result = await dialog.showSaveDialog(mainWindow, { defaultPath: defaultPath || undefined })
+  showWindow('dialog-return')
   return { filePath: result.canceled ? null : result.filePath || null }
 })
 
@@ -2048,10 +2236,16 @@ async function requestPermissions(): Promise<void> {
   if (process.platform !== 'darwin') return
 
   // ── Microphone (for voice input via Whisper) ──
+  // CRITICAL: fire-and-forget. Do NOT await this call.
+  // macOS can stall the dialog (ad-hoc signature, reinstall, Sequoia changes)
+  // which blocks createWindow() and makes the app appear dead -- no window,
+  // no shortcuts, no tray response. The await version caused a full outage.
   try {
     const micStatus = systemPreferences.getMediaAccessStatus('microphone')
     if (micStatus === 'not-determined') {
-      await systemPreferences.askForMediaAccess('microphone')
+      systemPreferences.askForMediaAccess('microphone').catch((err: any) => {
+        log(`Permission preflight: microphone request failed — ${err.message}`)
+      })
     }
   } catch (err: any) {
     log(`Permission preflight: microphone check failed — ${err.message}`)

@@ -91,6 +91,9 @@ interface State {
   /** Which tab (if any) is in ephemeral tall view (null = normal) */
   tallViewTabId: string | null
 
+  /** Incremented on every sendMessage to force ConversationView scroll-to-bottom */
+  scrollToBottomCounter: number
+
   // Settings dialog state
   settingsOpen: boolean
 
@@ -132,7 +135,7 @@ interface State {
   toggleFileEditor: (tabId: string) => void
   focusFileEditor: () => void
   blurFileEditor: () => void
-  openFileInEditor: (dir: string, tabId: string, filePath: string) => void
+  openFileInEditor: (dir: string, tabId: string, filePath: string, opts?: { insertAfterActive?: boolean }) => void
   closeFileEditorTab: (dir: string, fileId: string) => void
   setActiveEditorFile: (dir: string, fileId: string) => void
   createScratchFile: (dir: string) => void
@@ -152,7 +155,7 @@ interface State {
   forkTab: (sourceTabId: string) => Promise<string | null>
   rewindToMessage: (tabId: string, messageId: string) => void
   forkFromMessage: (tabId: string, messageId: string) => Promise<string | null>
-  resumeSession: (sessionId: string, title?: string, projectPath?: string, customTitle?: string | null) => Promise<string>
+  resumeSession: (sessionId: string, title?: string, projectPath?: string, customTitle?: string | null, encodedDir?: string | null) => Promise<string>
   addSystemMessage: (content: string) => void
   startBashCommand: (command: string, execId: string) => { toolMsgId: string; tabId: string }
   completeBashCommand: (tabId: string, toolMsgId: string, command: string, stdout: string, stderr: string, exitCode: number | null) => void
@@ -228,6 +231,7 @@ function makeLocalTab(): TabState {
     worktree: null,
     pendingWorktreeSetup: false,
     groupId: null,
+    contextTokens: null,
   }
 }
 
@@ -251,6 +255,8 @@ export const useSessionStore = create<State>((set, get) => ({
   tabsReady: false,
 
   tallViewTabId: null,
+
+  scrollToBottomCounter: 0,
 
   // Settings dialog
   settingsOpen: false,
@@ -572,7 +578,7 @@ export const useSessionStore = create<State>((set, get) => ({
   focusFileEditor: () => set({ fileEditorFocused: true }),
   blurFileEditor: () => set({ fileEditorFocused: false }),
 
-  openFileInEditor: (dir, tabId, filePath) => {
+  openFileInEditor: (dir, tabId, filePath, opts) => {
     const { closeExplorerOnFileOpen, openMarkdownInPreview } = useThemeStore.getState()
     set((s) => {
       const states = new Map(s.fileEditorStates)
@@ -596,7 +602,14 @@ export const useSessionStore = create<State>((set, get) => ({
           isReadOnly: !isEditableByDefault(fileName),
           isPreview: isMd && openMarkdownInPreview,
         }
-        states.set(dir, { activeFileId: id, files: [...current.files, newFile] })
+        if (opts?.insertAfterActive) {
+          const activeIdx = current.files.findIndex(f => f.id === current.activeFileId)
+          const files = [...current.files]
+          files.splice(activeIdx + 1, 0, newFile)
+          states.set(dir, { activeFileId: id, files })
+        } else {
+          states.set(dir, { activeFileId: id, files: [...current.files, newFile] })
+        }
       }
       // Also make editor visible for this directory
       const editorOpen = new Set(s.fileEditorOpenDirs)
@@ -1047,13 +1060,13 @@ export const useSessionStore = create<State>((set, get) => ({
     }
   },
 
-  resumeSession: async (sessionId, title, projectPath, customTitle) => {
+  resumeSession: async (sessionId, title, projectPath, customTitle, encodedDir) => {
     const defaultDir = projectPath || get().staticInfo?.homePath || '~'
     try {
       const { tabId } = await window.coda.createTab()
 
       // Load previous conversation messages from the JSONL file
-      const history = await window.coda.loadSession(sessionId, defaultDir).catch(() => [])
+      const history = await window.coda.loadSession(sessionId, defaultDir, encodedDir || undefined).catch(() => [])
       const messages: Message[] = history.map((m) => ({
         id: nextMsgId(),
         role: m.role as Message['role'],
@@ -1073,6 +1086,12 @@ export const useSessionStore = create<State>((set, get) => ({
         ? { tools: [{ toolName: lastToolMsg.toolName, toolUseId: 'restored' }] }
         : null
 
+      // Tab group assignment: manual mode -> default group, auto mode -> null (auto-computed)
+      const { tabGroupMode, tabGroups } = useThemeStore.getState()
+      const groupId = tabGroupMode === 'manual'
+        ? (tabGroups.find((g) => g.isDefault)?.id || tabGroups[0]?.id || null)
+        : null
+
       const tab: TabState = {
         ...makeLocalTab(),
         id: tabId,
@@ -1083,6 +1102,7 @@ export const useSessionStore = create<State>((set, get) => ({
         hasChosenDirectory: !!projectPath,
         messages,
         permissionDenied: restoredDenied,
+        groupId,
       }
       set((s) => ({
         tabs: [...s.tabs, tab],
@@ -1092,12 +1112,18 @@ export const useSessionStore = create<State>((set, get) => ({
       // Don't call initSession — the first real prompt will use --resume with the sessionId
       return tabId
     } catch {
+      const { tabGroupMode: tgm, tabGroups: tgs } = useThemeStore.getState()
+      const groupId = tgm === 'manual'
+        ? (tgs.find((g) => g.isDefault)?.id || tgs[0]?.id || null)
+        : null
+
       const tab = makeLocalTab()
       tab.claudeSessionId = sessionId
       tab.title = title || 'Resumed Session'
       tab.customTitle = customTitle || null
       tab.workingDirectory = defaultDir
       tab.hasChosenDirectory = !!projectPath
+      tab.groupId = groupId
       set((s) => ({
         tabs: [...s.tabs, tab],
         activeTabId: tab.id,
@@ -1435,6 +1461,12 @@ export const useSessionStore = create<State>((set, get) => ({
     // so the command can execute tools without manual approval
     if (!tab.claudeSessionId && tab.permissionMode === 'plan' && prompt.startsWith('/')) {
       get().setPermissionMode('auto')
+
+      // Move to in-progress group (same as plan-ready implement)
+      const { inProgressGroupId, tabGroupMode } = useThemeStore.getState()
+      if (inProgressGroupId && tabGroupMode === 'manual' && tab.groupId !== inProgressGroupId) {
+        get().moveTabToGroup(tab.id, inProgressGroupId)
+      }
     }
 
     const isBusy = tab.status === 'running'
@@ -1472,6 +1504,7 @@ export const useSessionStore = create<State>((set, get) => ({
     // Optimistic update: clear attachments
     // If busy, add to queuedPrompts (shown at bottom); otherwise add to messages and set connecting
     set((s) => ({
+      scrollToBottomCounter: s.scrollToBottomCounter + 1,
       tabs: s.tabs.map((t) => {
         if (t.id !== activeTabId) return t
         const withEffectiveBase = t.hasChosenDirectory
@@ -1723,6 +1756,10 @@ export const useSessionStore = create<State>((set, get) => ({
                 }
               }
             }
+            // Track context usage from assistant message
+            if (event.message?.usage?.input_tokens) {
+              updated.contextTokens = event.message.usage.input_tokens
+            }
             break
           }
 
@@ -1737,6 +1774,9 @@ export const useSessionStore = create<State>((set, get) => ({
               numTurns: event.numTurns,
               usage: event.usage,
               sessionId: event.sessionId,
+            }
+            if (event.usage?.input_tokens) {
+              updated.contextTokens = event.usage.input_tokens
             }
             // ── Final text fallback ──
             // If neither text_chunks nor task_update text produced an assistant message,

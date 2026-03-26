@@ -97,6 +97,7 @@ export function ConversationView() {
   const colors = useColors()
   const expandedUI = useThemeStore((s) => s.expandedUI)
   const isTallView = useSessionStore((s) => s.tallViewTabId === s.activeTabId)
+  const scrollToBottomCounter = useSessionStore((s) => s.scrollToBottomCounter)
 
   const tab = tabs.find((t) => t.id === activeTabId)
 
@@ -128,6 +129,14 @@ export function ConversationView() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
   }, [scrollTrigger])
+
+  // Force scroll to bottom when user sends a new message (even if scrolled up)
+  useEffect(() => {
+    if (scrollToBottomCounter > 0 && scrollRef.current) {
+      isNearBottomRef.current = true
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+  }, [scrollToBottomCounter])
 
   // Group only the visible slice of messages
   const allMessages = tab?.messages ?? []
@@ -973,7 +982,7 @@ const AssistantMessage = React.memo(function AssistantMessage({
 
   const inner = (
     <div className="group/msg relative">
-      <div className="text-[13px] leading-[1.6] prose-cloud min-w-0 max-w-[92%]">
+      <div className="text-[13px] leading-[1.6] prose-cloud min-w-0 max-w-[92%] overflow-hidden">
         <Markdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>
           {message.content}
         </Markdown>
