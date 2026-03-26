@@ -12,6 +12,7 @@ import { PermissionCard } from './PermissionCard'
 import { PermissionDeniedCard } from './PermissionDeniedCard'
 import { PlanViewer } from './PlanViewer'
 import { useColors, useThemeStore } from '../theme'
+import { useNavigableText, NavigableText, NavigableCode } from '../hooks/useNavigableLinks'
 import { InlineEditDiff } from './InlineEditDiff'
 import { TodoListPanel } from './TodoListPanel'
 import type { Message, Attachment } from '../../shared/types'
@@ -653,6 +654,7 @@ function MessageAttachments({ attachments }: { attachments: Attachment[] }) {
 function UserMessage({ message, skipMotion }: { message: Message; skipMotion?: boolean }) {
   const colors = useColors()
   const isBashCmd = !!message.userExecuted
+  const { onOpenFile, onOpenUrl } = useNavigableText()
 
   // Strip attachment context lines that may be in historical messages
   const displayContent = message.content
@@ -676,7 +678,9 @@ function UserMessage({ message, skipMotion }: { message: Message; skipMotion?: b
       </button>
     ),
     img: ({ src, alt }: any) => <ImageCard src={src} alt={alt} colors={colors} />,
-  }), [colors])
+    text: ({ children }: any) => <NavigableText onOpenFile={onOpenFile} onOpenUrl={onOpenUrl}>{children}</NavigableText>,
+    code: ({ children, className, ...props }: any) => <NavigableCode className={className} onOpenFile={onOpenFile} onOpenUrl={onOpenUrl} {...props}>{children}</NavigableCode>,
+  }), [colors, onOpenFile, onOpenUrl])
 
   const content = (
     <div
@@ -858,6 +862,7 @@ const AssistantMessage = React.memo(function AssistantMessage({
   skipMotion?: boolean
 }) {
   const colors = useColors()
+  const { onOpenFile, onOpenUrl } = useNavigableText()
 
   const markdownComponents = useMemo(() => ({
     table: ({ children }: any) => <TableScrollWrapper>{children}</TableScrollWrapper>,
@@ -874,7 +879,9 @@ const AssistantMessage = React.memo(function AssistantMessage({
       </button>
     ),
     img: ({ src, alt }: any) => <ImageCard src={src} alt={alt} colors={colors} />,
-  }), [colors])
+    text: ({ children }: any) => <NavigableText onOpenFile={onOpenFile} onOpenUrl={onOpenUrl}>{children}</NavigableText>,
+    code: ({ children, className, ...props }: any) => <NavigableCode className={className} onOpenFile={onOpenFile} onOpenUrl={onOpenUrl} {...props}>{children}</NavigableCode>,
+  }), [colors, onOpenFile, onOpenUrl])
 
   const inner = (
     <div className="group/msg relative">
