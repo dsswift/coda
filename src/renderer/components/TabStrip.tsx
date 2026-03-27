@@ -5,13 +5,22 @@ import { Plus, X, Prohibit, Terminal, FolderPlus, FolderOpen, GitBranch, GitFork
 import { useSessionStore } from '../stores/sessionStore'
 import { HistoryPicker } from './HistoryPicker'
 import { SettingsPopover } from './SettingsPopover'
-import { WorktreeCloseDialog } from './WorktreeCloseDialog'
 import { BranchPickerDialog } from './BranchPickerDialog'
 import { usePopoverLayer } from './PopoverLayer'
 import { useColors, useThemeStore, getEffectiveTabGroups } from '../theme'
 import { useTabGroups } from '../hooks/useTabGroups'
 import type { TabGroupView } from '../hooks/useTabGroups'
-import type { TabStatus, TabState, WorktreeStatus } from '../../shared/types'
+import type { TabStatus, TabState } from '../../shared/types'
+
+/** On-demand uncommitted check for worktree tabs whose status isn't in the map yet */
+function checkWorktreeUncommitted(tab: TabState | undefined) {
+  if (!tab?.worktree) return
+  const { worktreeUncommittedMap, setWorktreeUncommitted } = useSessionStore.getState()
+  if (worktreeUncommittedMap.has(tab.id)) return
+  window.coda.gitChanges(tab.workingDirectory).then((result) => {
+    setWorktreeUncommitted(tab.id, result.files.length > 0)
+  }).catch(() => {})
+}
 
 /** Check whether this tab-creation event should use worktree mode, inverting the default when Alt is held */
 const shouldUseWorktree = (altKey: boolean): boolean => {
@@ -164,6 +173,7 @@ function DirContextMenu({
   onCreateTab,
   onForkTab,
   onFinishWork,
+  finishWorkDisabled,
   onClose,
 }: {
   anchor: { x: number; y: number }
@@ -173,6 +183,7 @@ function DirContextMenu({
   onCreateTab: () => void
   onForkTab?: () => void
   onFinishWork?: () => void
+  finishWorkDisabled?: boolean | 'checking'
   onClose: () => void
 }) {
   const colors = useColors()
@@ -261,14 +272,21 @@ function DirContextMenu({
       )}
       {onFinishWork && (
         <button
-          onClick={() => { onFinishWork(); onClose() }}
+          onClick={() => { if (!finishWorkDisabled) { onFinishWork(); onClose() } }}
           className="flex items-center gap-2 w-full rounded px-2 py-1.5 text-left"
-          style={{ fontSize: 12, color: colors.textPrimary, background: 'transparent', border: 'none', cursor: 'pointer' }}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = colors.tabActive }}
+          style={{
+            fontSize: 12,
+            color: finishWorkDisabled ? colors.textTertiary : colors.textPrimary,
+            background: 'transparent',
+            border: 'none',
+            cursor: finishWorkDisabled ? 'not-allowed' : 'pointer',
+            opacity: finishWorkDisabled ? 0.5 : 1,
+          }}
+          onMouseEnter={(e) => { if (!finishWorkDisabled) (e.currentTarget as HTMLElement).style.background = colors.tabActive }}
           onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
         >
-          <CheckCircle size={14} color={colors.textSecondary} />
-          <span>Finish work</span>
+          <CheckCircle size={14} color={finishWorkDisabled ? colors.textTertiary : '#4ade80'} />
+          <span>{finishWorkDisabled === 'checking' ? 'Finish work (checking...)' : finishWorkDisabled ? 'Finish work (uncommitted changes)' : 'Finish work'}</span>
         </button>
       )}
       {tabGroupMode === 'manual' && (
@@ -320,6 +338,7 @@ function TabContextMenu({
   onForkTab,
   onNewTabInDir,
   onFinishWork,
+  finishWorkDisabled,
   onClose,
   groupTabs,
 }: {
@@ -329,6 +348,7 @@ function TabContextMenu({
   onForkTab?: () => void
   onNewTabInDir: () => void
   onFinishWork: () => void
+  finishWorkDisabled?: boolean | 'checking'
   onClose: () => void
   groupTabs?: TabState[]
 }) {
@@ -447,7 +467,7 @@ function TabContextMenu({
       )}
       {!tab.worktree && isGitRepo && (
         <button
-          onClick={tab.hasFileActivity ? undefined : () => { useSessionStore.getState().convertToWorktree(tab.id); onClose() }}
+          onClick={tab.hasFileActivity ? undefined : () => { useSessionStore.getState().convertToWorktree(tab.id); window.dispatchEvent(new CustomEvent('coda:close-group-pickers')); onClose() }}
           className="flex items-center gap-2 w-full rounded px-2 py-1.5 text-left"
           style={{
             ...menuItemStyle,
@@ -462,14 +482,17 @@ function TabContextMenu({
       )}
       {tab.worktree && (
         <button
-          onClick={() => { onFinishWork(); onClose() }}
+          onClick={() => { if (!finishWorkDisabled) { onFinishWork(); onClose() } }}
           className="flex items-center gap-2 w-full rounded px-2 py-1.5 text-left"
-          style={menuItemStyle}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = colors.tabActive }}
+          style={{
+            ...menuItemStyle,
+            ...(finishWorkDisabled ? { color: colors.textTertiary, cursor: 'not-allowed', opacity: 0.5 } : {}),
+          }}
+          onMouseEnter={(e) => { if (!finishWorkDisabled) (e.currentTarget as HTMLElement).style.background = colors.tabActive }}
           onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
         >
-          <CheckCircle size={14} color={colors.textSecondary} />
-          <span>Finish work</span>
+          <CheckCircle size={14} color={finishWorkDisabled ? colors.textTertiary : '#4ade80'} />
+          <span>{finishWorkDisabled === 'checking' ? 'Finish work (checking...)' : finishWorkDisabled ? 'Finish work (uncommitted changes)' : 'Finish work'}</span>
         </button>
       )}
       {tabGroupMode === 'manual' && (
@@ -915,6 +938,7 @@ function GroupPickerDropdown({
   const tabGroupMode = useThemeStore((s) => s.tabGroupMode)
   const renameTab = useSessionStore((s) => s.renameTab)
   const setTabPillColor = useSessionStore((s) => s.setTabPillColor)
+  const worktreeUncommittedMap = useSessionStore((s) => s.worktreeUncommittedMap)
 
   // Sub-interaction state
   const [confirmingCloseId, setConfirmingCloseId] = useState<string | null>(null)
@@ -924,6 +948,10 @@ function GroupPickerDropdown({
   const [dirMenuAnchor, setDirMenuAnchor] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
   const [editingTabId, setEditingTabId] = useState<string | null>(null)
   const [localTabs, setLocalTabs] = useState(group.tabs)
+
+  useEffect(() => {
+    if (dirMenuTabId) checkWorktreeUncommitted(group.tabs.find((t) => t.id === dirMenuTabId))
+  }, [dirMenuTabId])
 
   useEffect(() => {
     setLocalTabs(group.tabs)
@@ -1080,6 +1108,7 @@ function GroupPickerDropdown({
                 useSessionStore.getState().finishWorktreeTab(menuTab.id)
                 setDirMenuTabId(null)
               }}
+              finishWorkDisabled={menuTab.worktree ? (worktreeUncommittedMap.has(menuTab.id) ? worktreeUncommittedMap.get(menuTab.id)! : 'checking') : undefined}
               onClose={() => setDirMenuTabId(null)}
               groupTabs={group.tabs}
             />
@@ -1214,7 +1243,7 @@ function DropdownTabRow({
       onMouseDown={(e) => {
         if (e.button === 1) {
           e.preventDefault()
-          if (!isRunning && !tab.bashExecuting) onCloseTab(tab.id)
+          if (!tab.worktree && !isRunning && !tab.bashExecuting) onCloseTab(tab.id)
         }
       }}
       onContextMenu={(e) => {
@@ -1251,8 +1280,8 @@ function DropdownTabRow({
           style={{
             fontSize: 10,
             fontWeight: 500,
-            color: colors.textSecondary,
-            opacity: 0.5,
+            color: tab.worktree ? '#4ade80' : colors.textSecondary,
+            opacity: tab.worktree ? 0.6 : 0.5,
             cursor: 'default',
           }}
           onContextMenu={(e) => {
@@ -1296,7 +1325,7 @@ function DropdownTabRow({
         <PencilSimple size={10} />
       </button>
 
-      {isConfirming ? (
+      {tab.worktree ? null : isConfirming ? (
         <div className="flex items-center gap-0.5 text-[9px] flex-shrink-0" onClick={(e) => e.stopPropagation()}>
           <button
             onClick={() => setConfirmingCloseId(null)}
@@ -1511,6 +1540,7 @@ function InactiveGroupMenu({
   const tabGroupMode = useThemeStore((s) => s.tabGroupMode)
   const tabGroups = useThemeStore((s) => s.tabGroups)
   const moveTabToGroup = useSessionStore((s) => s.moveTabToGroup)
+  const worktreeUncommittedMap = useSessionStore((s) => s.worktreeUncommittedMap)
   const [moveSubmenu, setMoveSubmenu] = useState<{ x: number; y: number } | null>(null)
   const moveItemRef = useRef<HTMLButtonElement>(null)
   const submenuRef = useRef<HTMLDivElement>(null)
@@ -1698,6 +1728,7 @@ function GroupPill({
   const colors = useColors()
   const tabGroupMode = useThemeStore((s) => s.tabGroupMode)
   const renameTab = useSessionStore((s) => s.renameTab)
+  const worktreeUncommittedMap = useSessionStore((s) => s.worktreeUncommittedMap)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [pickerAnchor, setPickerAnchor] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
   const [mgmtMenu, setMgmtMenu] = useState<{ x: number; y: number } | null>(null)
@@ -1705,6 +1736,10 @@ function GroupPill({
   const [renamingTitle, setRenamingTitle] = useState(false)
   const [confirmingClose, setConfirmingClose] = useState(false)
   const pillRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (tabMenu) checkWorktreeUncommitted(selectedTab)
+  }, [tabMenu])
 
   // Close picker when any new tab is created (from +button, keyboard shortcut, or another picker)
   useEffect(() => {
@@ -1767,6 +1802,16 @@ function GroupPill({
           color: isActive ? colors.textPrimary : colors.textTertiary,
           fontWeight: isActive ? 500 : 400,
         } as React.CSSProperties}
+        onMouseDown={(e) => {
+          if (e.button === 1) {
+            e.preventDefault()
+            if (!isActive || !selectedTab || selectedTab.worktree) return
+            const running = selectedTab.status === 'running' || selectedTab.status === 'connecting'
+            if (!running && !selectedTab.bashExecuting) {
+              useSessionStore.getState().closeTab(selectedTab.id)
+            }
+          }
+        }}
         onClick={handleClick}
         onContextMenu={(e) => {
           if (tabGroupMode === 'manual') {
@@ -1905,6 +1950,7 @@ function GroupPill({
               onForkTab={tab.claudeSessionId ? () => { useSessionStore.getState().forkTab(tab.id) } : undefined}
               onNewTabInDir={() => useSessionStore.getState().createTabInDirectory(tab.workingDirectory, shouldUseWorktree(false))}
               onFinishWork={() => { if (tab.worktree) useSessionStore.getState().finishWorktreeTab(tab.id) }}
+              finishWorkDisabled={tab.worktree ? (worktreeUncommittedMap.has(tab.id) ? worktreeUncommittedMap.get(tab.id)! : 'checking') : undefined}
               onClose={() => setTabMenu(null)}
               groupTabs={group.tabs}
             />
@@ -1987,7 +2033,7 @@ function TabPill({
       : null
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
-    if (e.button === 1) { e.preventDefault(); if (!isRunning && !tab.bashExecuting) onClose(); return }
+    if (e.button === 1) { e.preventDefault(); if (!tab.worktree && !isRunning && !tab.bashExecuting) onClose(); return }
     if (e.button !== 0) return
     dragOrigin.current = { x: e.clientX, y: e.clientY }
     isDragging.current = false
@@ -2062,7 +2108,7 @@ function TabPill({
       {tab.forkedFromSessionId && !tab.worktree ? (
         <GitFork size={11} color={colors.textTertiary} className="flex-shrink-0" />
       ) : tab.worktree ? (
-        <GitBranch size={11} color={colors.textTertiary} className="flex-shrink-0" />
+        <GitBranch size={11} color="#4ade80" style={{ opacity: 0.7 }} className="flex-shrink-0" />
       ) : gitOpsMode === 'worktree' ? (
         <FolderSimple size={11} color={colors.textTertiary} className="flex-shrink-0" />
       ) : null}
@@ -2072,8 +2118,8 @@ function TabPill({
           style={{
             fontSize: 10,
             fontWeight: 500,
-            color: colors.textSecondary,
-            opacity: 0.5,
+            color: tab.worktree ? '#4ade80' : colors.textSecondary,
+            opacity: tab.worktree ? 0.6 : 0.5,
             cursor: 'default',
           }}
           onContextMenu={(e) => {
@@ -2108,7 +2154,7 @@ function TabPill({
           {displayTitle}
         </span>
       )}
-      {isConfirmingClose ? (
+      {tab.worktree ? null : isConfirmingClose ? (
         <div className="flex items-center gap-0.5 text-[9px] flex-shrink-0" onClick={(e) => e.stopPropagation()}>
           <button
             onClick={onCancelClose}
@@ -2159,6 +2205,7 @@ export function TabStrip() {
   const isExpanded = useSessionStore((s) => s.isExpanded)
   const toggleExpanded = useSessionStore((s) => s.toggleExpanded)
   const tabsReady = useSessionStore((s) => s.tabsReady)
+  const worktreeUncommittedMap = useSessionStore((s) => s.worktreeUncommittedMap)
   const { mode: groupMode, groups, ungrouped } = useTabGroups()
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null)
@@ -2170,11 +2217,14 @@ export function TabStrip() {
   const [recentDirsMenu, setRecentDirsMenu] = useState<{ x: number; y: number } | null>(null)
   const [tabMenuId, setTabMenuId] = useState<string | null>(null)
   const [tabMenuAnchor, setTabMenuAnchor] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
-  const [worktreeCloseTabId, setWorktreeCloseTabId] = useState<string | null>(null)
-  const [worktreeCloseStatus, setWorktreeCloseStatus] = useState<WorktreeStatus | null>(null)
   const plusButtonRef = useRef<HTMLButtonElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const tabRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+
+  useEffect(() => {
+    const id = dirMenuTabId || tabMenuId
+    if (id) checkWorktreeUncommitted(tabs.find((t) => t.id === id))
+  }, [dirMenuTabId, tabMenuId])
 
   // Scroll the confirming-close tab into view after it expands
   useEffect(() => {
@@ -2248,31 +2298,11 @@ export function TabStrip() {
                 isEditing={editingTabId === tab.id}
                 isConfirmingClose={confirmingCloseId === tab.id}
                 onSelect={() => selectTab(tab.id)}
-                onClose={() => {
-                  if (tab.worktree) {
-                    setWorktreeCloseTabId(tab.id)
-                    setWorktreeCloseStatus(null)
-                    window.coda.gitWorktreeStatus(tab.worktree.worktreePath, tab.worktree.sourceBranch)
-                      .then((status) => setWorktreeCloseStatus(status))
-                      .catch(() => setWorktreeCloseStatus({ hasUncommittedChanges: false, hasUnpushedCommits: false, isMerged: false, aheadCount: 0, behindCount: 0 }))
-                  } else {
-                    closeTab(tab.id)
-                  }
-                }}
+                onClose={() => closeTab(tab.id)}
                 onStartEdit={() => setEditingTabId(tab.id)}
                 onStopEdit={() => setEditingTabId(null)}
                 onRename={(newValue) => renameTab(tab.id, newValue)}
-                onConfirmClose={() => {
-                  if (tab.worktree) {
-                    setWorktreeCloseTabId(tab.id)
-                    setWorktreeCloseStatus(null)
-                    window.coda.gitWorktreeStatus(tab.worktree.worktreePath, tab.worktree.sourceBranch)
-                      .then((status) => setWorktreeCloseStatus(status))
-                      .catch(() => setWorktreeCloseStatus({ hasUncommittedChanges: false, hasUnpushedCommits: false, isMerged: false, aheadCount: 0, behindCount: 0 }))
-                  } else {
-                    setConfirmingCloseId(tab.id)
-                  }
-                }}
+                onConfirmClose={() => setConfirmingCloseId(tab.id)}
                 onCancelClose={() => setConfirmingCloseId(null)}
                 onSetPillColor={(color) => setTabPillColor(tab.id, color)}
                 colorPickerTabId={colorPickerTabId}
@@ -2398,6 +2428,7 @@ export function TabStrip() {
               onCreateTab={() => createTabInDirectory(menuTab.workingDirectory, shouldUseWorktree(false))}
               onForkTab={menuTab.claudeSessionId ? () => { useSessionStore.getState().forkTab(menuTab.id) } : undefined}
               onFinishWork={menuTab.worktree ? () => { useSessionStore.getState().finishWorktreeTab(menuTab.id) } : undefined}
+              finishWorkDisabled={menuTab.worktree ? (worktreeUncommittedMap.has(menuTab.id) ? worktreeUncommittedMap.get(menuTab.id)! : 'checking') : undefined}
               onClose={() => setDirMenuTabId(null)}
             />
           )
@@ -2432,50 +2463,24 @@ export function TabStrip() {
               onFinishWork={() => {
                 useSessionStore.getState().finishWorktreeTab(menuTab.id)
               }}
+              finishWorkDisabled={menuTab.worktree ? (worktreeUncommittedMap.has(menuTab.id) ? worktreeUncommittedMap.get(menuTab.id)! : 'checking') : undefined}
               onClose={() => setTabMenuId(null)}
             />
           )
         })()}
       </AnimatePresence>
 
-      {worktreeCloseTabId && worktreeCloseStatus && (() => {
-        const wtTab = tabs.find((t) => t.id === worktreeCloseTabId)
-        if (!wtTab) return null
-        const strategy = useThemeStore.getState().worktreeCompletionStrategy
-        return (
-          <WorktreeCloseDialog
-            uncommittedCount={worktreeCloseStatus.hasUncommittedChanges ? 1 : 0}
-            unpushedCount={worktreeCloseStatus.aheadCount}
-            defaultStrategy={strategy}
-            onFinish={(s) => {
-              useSessionStore.getState().finishWorktreeTab(worktreeCloseTabId, s)
-              setWorktreeCloseTabId(null)
-              setWorktreeCloseStatus(null)
-            }}
-            onDiscard={() => {
-              closeTab(worktreeCloseTabId)
-              setWorktreeCloseTabId(null)
-              setWorktreeCloseStatus(null)
-            }}
-            onCancel={() => {
-              setWorktreeCloseTabId(null)
-              setWorktreeCloseStatus(null)
-            }}
-          />
-        )
-      })()}
-
       {(() => {
-        const activeTab = tabs.find((t) => t.id === activeTabId)
-        if (!activeTab?.pendingWorktreeSetup) return null
+        const pendingTab = tabs.find((t) => t.pendingWorktreeSetup)
+        if (!pendingTab) return null
         return (
           <BranchPickerDialog
-            repoPath={activeTab.workingDirectory}
+            repoPath={pendingTab.workingDirectory}
             onSelect={(branch, setAsDefault) => {
-              useSessionStore.getState().setupWorktree(activeTab.id, branch, setAsDefault)
+              useSessionStore.getState().setupWorktree(pendingTab.id, branch, setAsDefault)
             }}
             onCancel={() => {
-              useSessionStore.getState().cancelWorktreeSetup(activeTab.id)
+              useSessionStore.getState().cancelWorktreeSetup(pendingTab.id)
             }}
           />
         )
