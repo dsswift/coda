@@ -170,12 +170,14 @@ interface State {
   removeDirectory: (dir: string) => void
   setBaseDirectory: (dir: string) => void
   setupWorktree: (tabId: string, sourceBranch: string, setAsDefault: boolean) => Promise<void>
+  convertToWorktree: (tabId: string) => void
   cancelWorktreeSetup: (tabId: string) => void
   finishWorktreeTab: (tabId: string, strategyOverride?: 'merge' | 'pr') => Promise<void>
   addAttachments: (attachments: FileAttachment[]) => void
   removeAttachment: (attachmentId: string) => void
   clearAttachments: () => void
   setDraftInput: (tabId: string, text: string) => void
+  clearPendingInput: (tabId: string) => void
   handleNormalizedEvent: (tabId: string, event: NormalizedEvent) => void
   handleStatusChange: (tabId: string, newStatus: string, oldStatus: string) => void
   handleError: (tabId: string, error: EnrichedError) => void
@@ -233,6 +235,7 @@ function makeLocalTab(): TabState {
     bashExecId: null,
     pillColor: null,
     forkedFromSessionId: null,
+    hasFileActivity: false,
     worktree: null,
     pendingWorktreeSetup: false,
     groupId: null,
@@ -311,6 +314,15 @@ export const useSessionStore = create<State>((set, get) => ({
     const defaultBase = useThemeStore.getState().defaultBaseDirectory
     const startDir = defaultBase || homeDir
     const hasChosen = !!defaultBase
+
+    const existingBlank = get().tabs.find(
+      (t) => t.messages.length === 0 && t.workingDirectory === startDir
+    )
+    if (existingBlank) {
+      set({ activeTabId: existingBlank.id })
+      return existingBlank.id
+    }
+
     let tabId: string
     try {
       const res = await window.coda.createTab()
@@ -360,6 +372,14 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   createTabInDirectory: async (dir, useWorktree) => {
+    const existingBlank = get().tabs.find(
+      (t) => t.messages.length === 0 && t.workingDirectory === dir
+    )
+    if (existingBlank) {
+      set({ activeTabId: existingBlank.id })
+      return existingBlank.id
+    }
+
     useThemeStore.getState().addRecentBaseDirectory(dir)
 
     let tabId: string
@@ -520,10 +540,11 @@ export const useSessionStore = create<State>((set, get) => ({
     set((s) => {
       const nextOpen = new Set(s.terminalOpenTabIds)
       const nextPending = new Map(s.terminalPendingCommands)
+      nextPending.set(tabId, cmd)
       if (nextOpen.has(tabId)) {
         window.coda.terminalWrite(tabId, cmd + '\n')
+        nextPending.delete(tabId)
       } else {
-        nextPending.set(tabId, cmd)
         nextOpen.add(tabId)
       }
       return { terminalOpenTabIds: nextOpen, terminalPendingCommands: nextPending }
@@ -1034,12 +1055,14 @@ export const useSessionStore = create<State>((set, get) => ({
     const idx = tab.messages.findIndex((m) => m.id === messageId)
     if (idx < 0) return
 
+    const targetMessage = tab.messages[idx]
     const oldSessionId = tab.claudeSessionId
     const historicalSessionIds = oldSessionId
       ? [...tab.historicalSessionIds, oldSessionId]
       : [...tab.historicalSessionIds]
 
-    const rewoundMessages = tab.messages.slice(0, idx + 1)
+    // Slice to right before the target message so user can re-send it
+    const rewoundMessages = tab.messages.slice(0, idx)
     const lastToolMsg = [...rewoundMessages].reverse().find((m) => m.toolName)
     const restoredDenied = (lastToolMsg?.toolName === 'ExitPlanMode' || lastToolMsg?.toolName === 'AskUserQuestion')
       ? { tools: [{ toolName: lastToolMsg.toolName, toolUseId: 'restored' }] }
@@ -1060,6 +1083,8 @@ export const useSessionStore = create<State>((set, get) => ({
               permissionQueue: [],
               permissionDenied: restoredDenied,
               queuedPrompts: [],
+              pendingInput: targetMessage.content,
+              draftInput: targetMessage.content,
             }
           : t
       ),
@@ -1395,6 +1420,14 @@ export const useSessionStore = create<State>((set, get) => ({
     }
   },
 
+  convertToWorktree: (tabId) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, pendingWorktreeSetup: true } : t
+      ),
+    }))
+  },
+
   cancelWorktreeSetup: (tabId) => {
     set((s) => ({
       tabs: s.tabs.map((t) =>
@@ -1493,6 +1526,14 @@ export const useSessionStore = create<State>((set, get) => ({
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.id === tabId ? { ...t, draftInput: text } : t
+      ),
+    }))
+  },
+
+  clearPendingInput: (tabId) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, pendingInput: undefined } : t
       ),
     }))
   },
@@ -1740,6 +1781,10 @@ export const useSessionStore = create<State>((set, get) => ({
               }
               if (useThemeStore.getState().expandToolResults && ['Write', 'Edit', 'NotebookEdit'].includes(targetTool.toolName || '')) {
                 targetTool.autoExpandResult = true
+              }
+              const FILE_WRITE_TOOLS = ['Write', 'Edit', 'NotebookEdit', 'MultiEdit']
+              if (!event.isError && FILE_WRITE_TOOLS.includes(targetTool.toolName || '')) {
+                updated.hasFileActivity = true
               }
             }
             updated.messages = msgs3
