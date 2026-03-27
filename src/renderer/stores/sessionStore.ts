@@ -1807,6 +1807,9 @@ export const useSessionStore = create<State>((set, get) => ({
             updated.sessionVersion = event.version
             // Don't change status/activity for warmup inits — they're invisible
             if (!event.isWarmup) {
+              // Don't overwrite terminal statuses with a late session_init (event ordering race)
+              const isTerminal = updated.status === 'failed' || updated.status === 'dead' || updated.status === 'completed'
+              if (isTerminal) break
               updated.status = 'running'
               updated.currentActivity = 'Thinking...'
               updated.permissionDenied = null
@@ -2104,8 +2107,10 @@ export const useSessionStore = create<State>((set, get) => ({
           ? {
               ...t,
               status: newStatus as TabStatus,
-              // Clear activity when transitioning to idle (e.g., after warmup init)
-              ...(newStatus === 'idle' ? { currentActivity: '', permissionQueue: [] as import('../../shared/types').PermissionRequest[], permissionDenied: null } : {}),
+              // Clear transient state on idle or terminal transitions
+              ...(newStatus === 'idle' || newStatus === 'failed' || newStatus === 'dead' || newStatus === 'completed'
+                ? { activeRequestId: null, currentActivity: '', permissionQueue: [] as import('../../shared/types').PermissionRequest[], permissionDenied: null }
+                : {}),
             }
           : t
       ),
@@ -2143,14 +2148,42 @@ export const useSessionStore = create<State>((set, get) => ({
     }))
   },
   moveTabToGroup: (tabId, groupId) => {
-    set((s) => ({
-      tabs: s.tabs.map((t) => t.id === tabId ? { ...t, groupId } : t),
-    }))
+    set((s) => {
+      const tab = s.tabs.find((t) => t.id === tabId)
+      if (!tab) return s
+      const updated = { ...tab, groupId }
+      const without = s.tabs.filter((t) => t.id !== tabId)
+      let insertIdx = -1
+      for (let i = without.length - 1; i >= 0; i--) {
+        if (without[i].groupId === groupId) { insertIdx = i; break }
+      }
+      const newTabs = [...without]
+      if (insertIdx >= 0) {
+        newTabs.splice(insertIdx + 1, 0, updated)
+      } else {
+        newTabs.push(updated)
+      }
+      return { tabs: newTabs }
+    })
   },
   setTabGroupId: (tabId, groupId) => {
-    set((s) => ({
-      tabs: s.tabs.map((t) => t.id === tabId ? { ...t, groupId } : t),
-    }))
+    set((s) => {
+      const tab = s.tabs.find((t) => t.id === tabId)
+      if (!tab) return s
+      const updated = { ...tab, groupId }
+      const without = s.tabs.filter((t) => t.id !== tabId)
+      let insertIdx = -1
+      for (let i = without.length - 1; i >= 0; i--) {
+        if (without[i].groupId === groupId) { insertIdx = i; break }
+      }
+      const newTabs = [...without]
+      if (insertIdx >= 0) {
+        newTabs.splice(insertIdx + 1, 0, updated)
+      } else {
+        newTabs.push(updated)
+      }
+      return { tabs: newTabs }
+    })
   },
   setWorktreeUncommitted: (tabId, hasChanges) => {
     const map = new Map(get().worktreeUncommittedMap)
