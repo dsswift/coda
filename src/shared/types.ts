@@ -178,6 +178,8 @@ export interface TabState {
   attachments: FileAttachment[]
   /** Draft input text for this tab's input bar (scoped per-tab) */
   draftInput: string
+  /** One-shot field: set by rewind, consumed by InputBar to pre-fill input, then cleared */
+  pendingInput?: string
   messages: Message[]
   title: string
   /** User-provided custom tab name (overrides auto-generated title when set) */
@@ -210,6 +212,8 @@ export interface TabState {
   pillColor: string | null
   /** Session ID this tab was forked from (null if not a fork) */
   forkedFromSessionId: string | null
+  /** True once a file-writing tool (Write, Edit, NotebookEdit, MultiEdit) completes successfully */
+  hasFileActivity: boolean
   /** Worktree metadata when tab operates inside a managed worktree */
   worktree: WorktreeInfo | null
   /** True while waiting for the user to pick a source branch in the BranchPickerDialog */
