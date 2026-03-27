@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Terminal, CaretDown, Check, FolderOpen, Plus, X, ShieldCheck, ListChecks, GitBranch, Code, TreeStructure, NotePencil, ArrowsOutSimple, ArrowsInSimple } from '@phosphor-icons/react'
+import { Terminal, CaretDown, Check, FolderOpen, Plus, X, ShieldCheck, ListChecks, GitBranch, Code, TreeStructure, NotePencil, ArrowsOutSimple, ArrowsInSimple, Copy } from '@phosphor-icons/react'
 import { useSessionStore, AVAILABLE_MODELS, getModelDisplayLabel } from '../stores/sessionStore'
 import { usePopoverLayer } from './PopoverLayer'
 import { useColors, useThemeStore } from '../theme'
@@ -353,10 +353,12 @@ function OpenWithPicker() {
     return () => document.removeEventListener('mousedown', handler)
   }, [open])
 
+  const openCliInTerminal = useSessionStore((s) => s.openCliInTerminal)
+
   const handleExecute = () => {
     if (!tab) return
     if (preferredOpenWith === 'cli') {
-      window.coda.openInTerminal(tab.claudeSessionId, tab.workingDirectory)
+      openCliInTerminal(tab.id, tab.claudeSessionId, tab.workingDirectory)
     } else {
       window.coda.openInVSCode(tab.workingDirectory)
     }
@@ -441,6 +443,24 @@ function OpenWithPicker() {
                 </button>
               )
             })}
+            {tab?.claudeSessionId && (
+              <>
+                <div className="mx-2 my-1" style={{ borderTop: `1px solid ${colors.popoverBorder}` }} />
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(tab.claudeSessionId)
+                    setOpen(false)
+                  }}
+                  className="w-full flex items-center px-3 py-1.5 text-[11px] transition-colors"
+                  style={{ color: colors.textSecondary }}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Copy size={12} />
+                    Copy Session ID
+                  </span>
+                </button>
+              </>
+            )}
           </div>
         </motion.div>,
         popoverLayer,

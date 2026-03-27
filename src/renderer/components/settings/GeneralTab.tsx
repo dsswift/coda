@@ -1,5 +1,5 @@
 import React, { useCallback, useState } from 'react'
-import { FolderOpen, Trash, PencilSimple, Star, Plus, Lightning } from '@phosphor-icons/react'
+import { FolderOpen, Trash, PencilSimple, Star, Plus, Lightning, CheckCircle } from '@phosphor-icons/react'
 import { useColors, useThemeStore, getEffectiveTabGroups } from '../../theme'
 import { useSessionStore } from '../../stores/sessionStore'
 import { SettingToggle } from './SettingToggle'
@@ -27,10 +27,18 @@ export function GeneralTab() {
   const setShowTodoList = useThemeStore((s) => s.setShowTodoList)
   const hideOnExternalLaunch = useThemeStore((s) => s.hideOnExternalLaunch)
   const setHideOnExternalLaunch = useThemeStore((s) => s.setHideOnExternalLaunch)
+  const keepExplorerOnCollapse = useThemeStore((s) => s.keepExplorerOnCollapse)
+  const setKeepExplorerOnCollapse = useThemeStore((s) => s.setKeepExplorerOnCollapse)
+  const keepTerminalOnCollapse = useThemeStore((s) => s.keepTerminalOnCollapse)
+  const setKeepTerminalOnCollapse = useThemeStore((s) => s.setKeepTerminalOnCollapse)
+  const keepGitPanelOnCollapse = useThemeStore((s) => s.keepGitPanelOnCollapse)
+  const setKeepGitPanelOnCollapse = useThemeStore((s) => s.setKeepGitPanelOnCollapse)
   const closeExplorerOnFileOpen = useThemeStore((s) => s.closeExplorerOnFileOpen)
   const setCloseExplorerOnFileOpen = useThemeStore((s) => s.setCloseExplorerOnFileOpen)
   const openMarkdownInPreview = useThemeStore((s) => s.openMarkdownInPreview)
   const setOpenMarkdownInPreview = useThemeStore((s) => s.setOpenMarkdownInPreview)
+  const commitCommand = useThemeStore((s) => s.commitCommand)
+  const setCommitCommand = useThemeStore((s) => s.setCommitCommand)
   const gitOpsMode = useThemeStore((s) => s.gitOpsMode)
   const setGitOpsMode = useThemeStore((s) => s.setGitOpsMode)
   const worktreeCompletionStrategy = useThemeStore((s) => s.worktreeCompletionStrategy)
@@ -43,6 +51,7 @@ export function GeneralTab() {
   const setTabGroupMode = useThemeStore((s) => s.setTabGroupMode)
   const tabGroups = useThemeStore((s) => s.tabGroups)
   const inProgressGroupId = useThemeStore((s) => s.inProgressGroupId)
+  const doneGroupId = useThemeStore((s) => s.doneGroupId)
 
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null)
   const [editValue, setEditValue] = useState('')
@@ -58,6 +67,11 @@ export function GeneralTab() {
       useSessionStore.setState((s) => ({
         tabs: s.tabs.map((t) => ({ ...t, groupId: effectiveGroups[0].id })),
       }))
+      // Auto-assign role IDs to default groups
+      const ipGroup = effectiveGroups.find(g => g.label === 'In Progress')
+      const doneGroup = effectiveGroups.find(g => g.label === 'Testing')
+      if (ipGroup && !useThemeStore.getState().inProgressGroupId) useThemeStore.getState().setInProgressGroupId(ipGroup.id)
+      if (doneGroup && !useThemeStore.getState().doneGroupId) useThemeStore.getState().setDoneGroupId(doneGroup.id)
     } else if (newMode === 'auto' && oldMode === 'manual') {
       useSessionStore.setState((s) => ({
         tabs: s.tabs.map((t) => ({ ...t, groupId: null })),
@@ -84,6 +98,11 @@ export function GeneralTab() {
         return idx >= 0 ? { ...t, groupId: groups[idx].id } : t
       }),
     }))
+    // Auto-assign role IDs to materialized groups
+    const ipGroup = groups.find(g => g.label === 'In Progress')
+    const doneGroup = groups.find(g => g.label === 'Testing')
+    if (ipGroup && !useThemeStore.getState().inProgressGroupId) useThemeStore.getState().setInProgressGroupId(ipGroup.id)
+    if (doneGroup && !useThemeStore.getState().doneGroupId) useThemeStore.getState().setDoneGroupId(doneGroup.id)
     return groups
   }, [])
 
@@ -295,6 +314,31 @@ export function GeneralTab() {
         </>
       )}
 
+      <SettingSection
+        label="Commit Command"
+        description="Bash command to run in the terminal instead of prompting the LLM. Leave empty for default behavior."
+      >
+        <input
+          type="text"
+          value={commitCommand}
+          onChange={(e) => setCommitCommand(e.target.value)}
+          placeholder="e.g. commit --smart"
+          style={{
+            width: '100%',
+            padding: '7px 10px',
+            fontSize: 13,
+            fontFamily: 'Menlo, Monaco, monospace',
+            background: colors.surfacePrimary,
+            color: colors.textPrimary,
+            border: `1px solid ${colors.containerBorder}`,
+            borderRadius: 8,
+            outline: 'none',
+          }}
+          onFocus={(e) => { e.currentTarget.style.borderColor = colors.accent }}
+          onBlur={(e) => { e.currentTarget.style.borderColor = colors.containerBorder }}
+        />
+      </SettingSection>
+
       {/* ── Tabs ── */}
       <SettingHeading>Tabs</SettingHeading>
 
@@ -438,6 +482,28 @@ export function GeneralTab() {
                   }}
                 >
                   <Lightning size={14} weight={inProgressGroupId === group.id ? 'fill' : 'regular'} />
+                </button>
+
+                {/* CheckCircle icon -- set as done group */}
+                <button
+                  onClick={() => {
+                    const groups = materializeDefaults()
+                    const target = groups.find(g => g.label === group.label) || groups[0]
+                    const current = useThemeStore.getState().doneGroupId
+                    useThemeStore.getState().setDoneGroupId(current === target.id ? null : target.id)
+                  }}
+                  title={doneGroupId === group.id ? 'Done group (click to unset)' : 'Set as done group'}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                    padding: 2,
+                    display: 'flex',
+                    alignItems: 'center',
+                    color: doneGroupId === group.id ? '#7aac8c' : colors.textTertiary,
+                  }}
+                >
+                  <CheckCircle size={14} weight={doneGroupId === group.id ? 'fill' : 'regular'} />
                 </button>
 
                 {/* Label -- double-click to rename, or editable input */}
@@ -630,6 +696,30 @@ export function GeneralTab() {
         description="Display the agent's todo/task checklist at the bottom of the conversation while working."
         checked={showTodoList}
         onChange={setShowTodoList}
+      />
+
+      {/* ── Minimize Behavior ── */}
+      <SettingHeading>Minimize Behavior</SettingHeading>
+
+      <SettingToggle
+        label="Keep Explorer Open"
+        description="Keep the file explorer open when the conversation is minimized."
+        checked={keepExplorerOnCollapse}
+        onChange={setKeepExplorerOnCollapse}
+      />
+
+      <SettingToggle
+        label="Keep Console Open"
+        description="Keep the terminal console open when the conversation is minimized."
+        checked={keepTerminalOnCollapse}
+        onChange={setKeepTerminalOnCollapse}
+      />
+
+      <SettingToggle
+        label="Keep Git Panel Open"
+        description="Keep the git panel open when the conversation is minimized."
+        checked={keepGitPanelOnCollapse}
+        onChange={setKeepGitPanelOnCollapse}
       />
 
       {/* ── File Explorer / Editor ── */}

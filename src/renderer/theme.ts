@@ -351,6 +351,12 @@ interface ThemeState {
   showTodoList: boolean
   /** Hide CODA overlay when launching external apps (Finder, Terminal, VS Code, etc.) */
   hideOnExternalLaunch: boolean
+  /** Keep explorer open when conversation is minimized */
+  keepExplorerOnCollapse: boolean
+  /** Keep terminal open when conversation is minimized */
+  keepTerminalOnCollapse: boolean
+  /** Keep git panel open when conversation is minimized */
+  keepGitPanelOnCollapse: boolean
   /** Tab grouping mode: off (flat), auto (by directory), manual (user-defined groups) */
   tabGroupMode: TabGroupMode
   /** Manual/auto tab group definitions */
@@ -359,6 +365,10 @@ interface ThemeState {
   autoGroupOrder: string[]
   /** Group ID that tabs auto-move into when implementation starts (null = disabled) */
   inProgressGroupId: string | null
+  /** Group ID that tabs move into after committing (null = disabled) */
+  doneGroupId: string | null
+  /** Custom bash command to run instead of prompting the LLM for commits */
+  commitCommand: string
   /** OS-reported dark mode — used when themeMode is 'system' */
   _systemIsDark: boolean
   setIsDark: (isDark: boolean) => void
@@ -390,6 +400,9 @@ interface ThemeState {
   setAllowSettingsEdits: (enabled: boolean) => void
   setShowTodoList: (enabled: boolean) => void
   setHideOnExternalLaunch: (enabled: boolean) => void
+  setKeepExplorerOnCollapse: (enabled: boolean) => void
+  setKeepTerminalOnCollapse: (enabled: boolean) => void
+  setKeepGitPanelOnCollapse: (enabled: boolean) => void
   setTabGroupMode: (mode: TabGroupMode) => void
   setTabGroups: (groups: TabGroup[]) => void
   createTabGroup: (label: string) => string
@@ -399,6 +412,8 @@ interface ThemeState {
   reorderTabGroups: (reorderedGroups: TabGroup[]) => void
   setAutoGroupOrder: (order: string[]) => void
   setInProgressGroupId: (groupId: string | null) => void
+  setDoneGroupId: (groupId: string | null) => void
+  setCommitCommand: (cmd: string) => void
   /** Called by OS theme change listener — updates system value */
   setSystemTheme: (isDark: boolean) => void
 }
@@ -422,7 +437,7 @@ function applyTheme(isDark: boolean): void {
   syncTokensToCss(isDark ? darkColors : lightColors)
 }
 
-const SETTINGS_DEFAULTS = { themeMode: 'dark' as ThemeMode, soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', recentBaseDirectories: [] as string[], preferredOpenWith: 'cli' as 'cli' | 'vscode', showImplementClearContext: false, defaultPermissionMode: 'plan' as 'ask' | 'auto' | 'plan', expandOnTabSwitch: true, bashCommandEntry: false, gitPanelSplitRatio: 0.4, gitPanelChangesOpen: true, gitPanelGraphOpen: true, expandToolResults: false, terminalFontFamily: 'Menlo, Monaco, monospace', terminalFontSize: 13, closeExplorerOnFileOpen: true, openMarkdownInPreview: true, editorWordWrap: true, gitOpsMode: 'manual' as GitOpsMode, worktreeCompletionStrategy: 'merge' as WorktreeCompletionStrategy, worktreeBranchDefaults: {} as Record<string, string>, worktreeSkipPrTitle: false, allowSettingsEdits: false, showTodoList: true, hideOnExternalLaunch: true, tabGroupMode: 'off' as TabGroupMode, tabGroups: [] as TabGroup[], autoGroupOrder: [] as string[], inProgressGroupId: null as string | null }
+const SETTINGS_DEFAULTS = { themeMode: 'dark' as ThemeMode, soundEnabled: true, expandedUI: false, defaultBaseDirectory: '', recentBaseDirectories: [] as string[], preferredOpenWith: 'cli' as 'cli' | 'vscode', showImplementClearContext: false, defaultPermissionMode: 'plan' as 'ask' | 'auto' | 'plan', expandOnTabSwitch: true, bashCommandEntry: false, gitPanelSplitRatio: 0.4, gitPanelChangesOpen: true, gitPanelGraphOpen: true, expandToolResults: false, terminalFontFamily: 'Menlo, Monaco, monospace', terminalFontSize: 13, closeExplorerOnFileOpen: true, openMarkdownInPreview: true, editorWordWrap: true, gitOpsMode: 'manual' as GitOpsMode, worktreeCompletionStrategy: 'merge' as WorktreeCompletionStrategy, worktreeBranchDefaults: {} as Record<string, string>, worktreeSkipPrTitle: false, allowSettingsEdits: false, showTodoList: true, hideOnExternalLaunch: true, keepExplorerOnCollapse: false, keepTerminalOnCollapse: false, keepGitPanelOnCollapse: false, tabGroupMode: 'off' as TabGroupMode, tabGroups: [] as TabGroup[], autoGroupOrder: [] as string[], inProgressGroupId: null as string | null, doneGroupId: null as string | null, commitCommand: '' }
 
 function saveSettings(s: Record<string, unknown>): void {
   window.coda?.saveSettings(s)
@@ -430,7 +445,7 @@ function saveSettings(s: Record<string, unknown>): void {
 
 function getAllSettings(get: () => ThemeState): Record<string, unknown> {
   const s = get()
-  return { themeMode: s.themeMode, soundEnabled: s.soundEnabled, expandedUI: s.expandedUI, defaultBaseDirectory: s.defaultBaseDirectory, recentBaseDirectories: s.recentBaseDirectories, preferredOpenWith: s.preferredOpenWith, showImplementClearContext: s.showImplementClearContext, defaultPermissionMode: s.defaultPermissionMode, expandOnTabSwitch: s.expandOnTabSwitch, bashCommandEntry: s.bashCommandEntry, gitPanelSplitRatio: s.gitPanelSplitRatio, gitPanelChangesOpen: s.gitPanelChangesOpen, gitPanelGraphOpen: s.gitPanelGraphOpen, expandToolResults: s.expandToolResults, terminalFontFamily: s.terminalFontFamily, terminalFontSize: s.terminalFontSize, gitOpsMode: s.gitOpsMode, worktreeCompletionStrategy: s.worktreeCompletionStrategy, worktreeBranchDefaults: s.worktreeBranchDefaults, worktreeSkipPrTitle: s.worktreeSkipPrTitle, allowSettingsEdits: s.allowSettingsEdits, showTodoList: s.showTodoList, hideOnExternalLaunch: s.hideOnExternalLaunch, tabGroupMode: s.tabGroupMode, tabGroups: s.tabGroups, autoGroupOrder: s.autoGroupOrder, inProgressGroupId: s.inProgressGroupId }
+  return { themeMode: s.themeMode, soundEnabled: s.soundEnabled, expandedUI: s.expandedUI, defaultBaseDirectory: s.defaultBaseDirectory, recentBaseDirectories: s.recentBaseDirectories, preferredOpenWith: s.preferredOpenWith, showImplementClearContext: s.showImplementClearContext, defaultPermissionMode: s.defaultPermissionMode, expandOnTabSwitch: s.expandOnTabSwitch, bashCommandEntry: s.bashCommandEntry, gitPanelSplitRatio: s.gitPanelSplitRatio, gitPanelChangesOpen: s.gitPanelChangesOpen, gitPanelGraphOpen: s.gitPanelGraphOpen, expandToolResults: s.expandToolResults, terminalFontFamily: s.terminalFontFamily, terminalFontSize: s.terminalFontSize, gitOpsMode: s.gitOpsMode, worktreeCompletionStrategy: s.worktreeCompletionStrategy, worktreeBranchDefaults: s.worktreeBranchDefaults, worktreeSkipPrTitle: s.worktreeSkipPrTitle, allowSettingsEdits: s.allowSettingsEdits, showTodoList: s.showTodoList, hideOnExternalLaunch: s.hideOnExternalLaunch, keepExplorerOnCollapse: s.keepExplorerOnCollapse, keepTerminalOnCollapse: s.keepTerminalOnCollapse, keepGitPanelOnCollapse: s.keepGitPanelOnCollapse, tabGroupMode: s.tabGroupMode, tabGroups: s.tabGroups, autoGroupOrder: s.autoGroupOrder, inProgressGroupId: s.inProgressGroupId, doneGroupId: s.doneGroupId, commitCommand: s.commitCommand }
 }
 
 /** Returns effective tab groups: custom groups if any exist, otherwise built-in defaults */
@@ -476,10 +491,15 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   allowSettingsEdits: saved.allowSettingsEdits,
   showTodoList: saved.showTodoList,
   hideOnExternalLaunch: saved.hideOnExternalLaunch,
+  keepExplorerOnCollapse: saved.keepExplorerOnCollapse,
+  keepTerminalOnCollapse: saved.keepTerminalOnCollapse,
+  keepGitPanelOnCollapse: saved.keepGitPanelOnCollapse,
   tabGroupMode: saved.tabGroupMode,
   tabGroups: saved.tabGroups,
   autoGroupOrder: saved.autoGroupOrder,
   inProgressGroupId: saved.inProgressGroupId,
+  doneGroupId: saved.doneGroupId,
+  commitCommand: saved.commitCommand,
   _systemIsDark: true,
   setIsDark: (isDark) => {
     set({ isDark })
@@ -605,6 +625,18 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
     set({ hideOnExternalLaunch: enabled })
     saveSettings(getAllSettings(get))
   },
+  setKeepExplorerOnCollapse: (enabled) => {
+    set({ keepExplorerOnCollapse: enabled })
+    saveSettings(getAllSettings(get))
+  },
+  setKeepTerminalOnCollapse: (enabled) => {
+    set({ keepTerminalOnCollapse: enabled })
+    saveSettings(getAllSettings(get))
+  },
+  setKeepGitPanelOnCollapse: (enabled) => {
+    set({ keepGitPanelOnCollapse: enabled })
+    saveSettings(getAllSettings(get))
+  },
   setTabGroupMode: (mode) => {
     set({ tabGroupMode: mode })
     saveSettings(getAllSettings(get))
@@ -635,6 +667,7 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
     // Clear in-progress designation if this group was it
     const patch: Partial<ThemeState> = { tabGroups: updated }
     if (get().inProgressGroupId === groupId) patch.inProgressGroupId = null
+    if (get().doneGroupId === groupId) patch.doneGroupId = null
     set(patch)
     saveSettings(getAllSettings(get))
   },
@@ -657,6 +690,14 @@ export const useThemeStore = create<ThemeState>((set, get) => ({
   },
   setInProgressGroupId: (groupId) => {
     set({ inProgressGroupId: groupId })
+    saveSettings(getAllSettings(get))
+  },
+  setDoneGroupId: (groupId) => {
+    set({ doneGroupId: groupId })
+    saveSettings(getAllSettings(get))
+  },
+  setCommitCommand: (cmd) => {
+    set({ commitCommand: cmd })
     saveSettings(getAllSettings(get))
   },
   setSystemTheme: (isDark) => {
@@ -706,7 +747,9 @@ window.coda?.loadSettings().then((disk) => {
   const tabGroups = Array.isArray(disk.tabGroups) ? (disk.tabGroups as TabGroup[]).filter((g: any) => g && typeof g.id === 'string' && typeof g.label === 'string') : []
   const autoGroupOrder = Array.isArray(disk.autoGroupOrder) ? (disk.autoGroupOrder as string[]).filter((d: unknown) => typeof d === 'string') : []
   const inProgressGroupId = typeof disk.inProgressGroupId === 'string' ? disk.inProgressGroupId : null
-  useThemeStore.setState({ themeMode: mode, isDark: resolved, soundEnabled: sound, expandedUI: expanded, defaultBaseDirectory: baseDir, recentBaseDirectories: recentDirs, preferredOpenWith: openWith, showImplementClearContext: implClearCtx, expandOnTabSwitch: expandTabSwitch, bashCommandEntry: bashCmd, gitPanelSplitRatio: splitRatio, gitPanelChangesOpen: changesOpen, gitPanelGraphOpen: graphOpen, expandToolResults: expandTools, terminalFontFamily: termFont, terminalFontSize: termSize, closeExplorerOnFileOpen: closeExplorer, openMarkdownInPreview: mdPreview, editorWordWrap: wordWrap, gitOpsMode, worktreeCompletionStrategy: wtStrategy, worktreeBranchDefaults: wtDefaults, worktreeSkipPrTitle: wtSkipPr, allowSettingsEdits: allowSettings, showTodoList: showTodo, hideOnExternalLaunch: hideExternal, tabGroupMode: tabGroupMode as TabGroupMode, tabGroups, autoGroupOrder, inProgressGroupId })
+  const doneGroupId = typeof disk.doneGroupId === 'string' ? disk.doneGroupId : null
+  const commitCommand = typeof disk.commitCommand === 'string' ? disk.commitCommand : ''
+  useThemeStore.setState({ themeMode: mode, isDark: resolved, soundEnabled: sound, expandedUI: expanded, defaultBaseDirectory: baseDir, recentBaseDirectories: recentDirs, preferredOpenWith: openWith, showImplementClearContext: implClearCtx, expandOnTabSwitch: expandTabSwitch, bashCommandEntry: bashCmd, gitPanelSplitRatio: splitRatio, gitPanelChangesOpen: changesOpen, gitPanelGraphOpen: graphOpen, expandToolResults: expandTools, terminalFontFamily: termFont, terminalFontSize: termSize, closeExplorerOnFileOpen: closeExplorer, openMarkdownInPreview: mdPreview, editorWordWrap: wordWrap, gitOpsMode, worktreeCompletionStrategy: wtStrategy, worktreeBranchDefaults: wtDefaults, worktreeSkipPrTitle: wtSkipPr, allowSettingsEdits: allowSettings, showTodoList: showTodo, hideOnExternalLaunch: hideExternal, tabGroupMode: tabGroupMode as TabGroupMode, tabGroups, autoGroupOrder, inProgressGroupId, doneGroupId, commitCommand })
   applyTheme(resolved)
 })
 

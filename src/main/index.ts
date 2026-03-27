@@ -847,7 +847,7 @@ ipcMain.handle(IPC.LIST_ALL_SESSIONS, async () => {
  * Removes hidden tags entirely and strips wrapper tags from visible content.
  */
 function cleanCliTags(text: string): string {
-  let result = text.replace(/<(?:local-command-caveat|system-reminder|command-name|command-message|command-args)[^>]*>[\s\S]*?<\/(?:local-command-caveat|system-reminder|command-name|command-message|command-args)>/g, '')
+  let result = text.replace(/<(?:local-command-caveat|system-reminder|command-name|command-message|command-args|task-notification)[^>]*>[\s\S]*?<\/(?:local-command-caveat|system-reminder|command-name|command-message|command-args|task-notification)>\s*(?:Read the output file to retrieve the result:[^\n]*)?\n?/g, '')
   result = result.replace(/<\/?(?:bash-input|bash-stdout|bash-stderr)[^>]*>/g, '')
   return result.trim()
 }
@@ -1178,6 +1178,45 @@ ipcMain.handle(IPC.ATTACH_FILES, async () => {
       size: stat.size,
     }
   })
+})
+
+ipcMain.handle(IPC.ATTACH_FILE_BY_PATH, async (_event, fp: string) => {
+  const { basename, extname } = require('path')
+  const { readFileSync, statSync } = require('fs')
+
+  const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'])
+  const mimeMap: Record<string, string> = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+    '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown',
+    '.json': 'application/json', '.yaml': 'text/yaml', '.toml': 'text/toml',
+  }
+
+  try {
+    const ext = extname(fp).toLowerCase()
+    const mime = mimeMap[ext] || 'application/octet-stream'
+    const stat = statSync(fp)
+    let dataUrl: string | undefined
+
+    if (IMAGE_EXTS.has(ext) && stat.size < 2 * 1024 * 1024) {
+      try {
+        const buf = readFileSync(fp)
+        dataUrl = `data:${mime};base64,${buf.toString('base64')}`
+      } catch {}
+    }
+
+    return {
+      id: crypto.randomUUID(),
+      type: IMAGE_EXTS.has(ext) ? 'image' : 'file',
+      name: basename(fp),
+      path: fp,
+      mimeType: mime,
+      dataUrl,
+      size: stat.size,
+    }
+  } catch {
+    return null
+  }
 })
 
 ipcMain.handle(IPC.TAKE_SCREENSHOT, async () => {
@@ -2236,16 +2275,12 @@ async function requestPermissions(): Promise<void> {
   if (process.platform !== 'darwin') return
 
   // ── Microphone (for voice input via Whisper) ──
-  // CRITICAL: fire-and-forget. Do NOT await this call.
-  // macOS can stall the dialog (ad-hoc signature, reinstall, Sequoia changes)
-  // which blocks createWindow() and makes the app appear dead -- no window,
-  // no shortcuts, no tray response. The await version caused a full outage.
+  // Await the permission dialog so it doesn't get lost behind the overlay.
+  // This runs before createWindow(), so there's no window to appear dead.
   try {
     const micStatus = systemPreferences.getMediaAccessStatus('microphone')
     if (micStatus === 'not-determined') {
-      systemPreferences.askForMediaAccess('microphone').catch((err: any) => {
-        log(`Permission preflight: microphone request failed — ${err.message}`)
-      })
+      await systemPreferences.askForMediaAccess('microphone')
     }
   } catch (err: any) {
     log(`Permission preflight: microphone check failed — ${err.message}`)
