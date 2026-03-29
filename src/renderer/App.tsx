@@ -174,7 +174,7 @@ export default function App() {
             const tabId = await useSessionStore.getState().resumeSession(
               st.claudeSessionId,
               st.title,
-              st.worktree?.repoPath || st.workingDirectory,
+              st.workingDirectory,
             )
             restoredTabIds.push({ tabId, sessionId: st.claudeSessionId, index: i })
 
@@ -202,6 +202,7 @@ export default function App() {
                       permissionMode: st.permissionMode,
                       bashResults: st.bashResults || [],
                       pillColor: st.pillColor || null,
+                      pillIcon: st.pillIcon || null,
                       worktree: restoredWorktree,
                       historicalSessionIds: st.historicalSessionIds || [],
                       groupId: st.groupId || null,
@@ -230,6 +231,7 @@ export default function App() {
                       additionalDirs: st.additionalDirs,
                       permissionMode: st.permissionMode,
                       pillColor: st.pillColor || null,
+                      pillIcon: st.pillIcon || null,
                       forkedFromSessionId: st.forkedFromSessionId || null,
                       worktree: st.worktree || null,
                       historicalSessionIds: st.historicalSessionIds || [],
@@ -249,7 +251,7 @@ export default function App() {
           if (historicalIds.length > 0) {
             const allHistoricalMessages: Message[] = []
             for (const hid of historicalIds) {
-              const history = await window.coda.loadSession(hid, st.worktree?.repoPath || st.workingDirectory).catch(() => [])
+              const history = await window.coda.loadSession(hid, st.workingDirectory).catch(() => [])
               const msgs = history.map((m) => ({
                 id: crypto.randomUUID(),
                 role: m.role as Message['role'],
@@ -513,12 +515,12 @@ export default function App() {
         const s = useSessionStore.getState()
         const tab = s.tabs.find((t) => t.id === s.activeTabId)
         if (!tab) return
-        const dir = tab.workingDirectory
-        if (s.fileEditorOpenDirs.has(dir)) {
-          s.createScratchFile(dir)
-        } else {
-          s.toggleFileEditor(s.activeTabId)
+        const dir = editorDirForTab(tab)
+        if (!s.fileEditorOpenDirs.has(dir)) {
+          // Open the editor panel (without creating a default file — we'll create one below)
+          useSessionStore.setState({ fileEditorOpenDirs: new Set([...s.fileEditorOpenDirs, dir]), fileEditorFocused: true })
         }
+        s.createScratchFile(dir)
       }
       if (e.metaKey && e.shiftKey && e.key === 't') {
         e.preventDefault()

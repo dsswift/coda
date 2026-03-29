@@ -63,6 +63,19 @@ export function editorDirForTab(tab: TabState): string {
 let editorFileCounter = 0
 const nextEditorFileId = () => `ef-${++editorFileCounter}`
 
+function nextUntitledName(states: Map<string, FileEditorDirState>): string {
+  const used = new Set<number>()
+  for (const state of states.values()) {
+    for (const f of state.files) {
+      const m = f.fileName.match(/^Untitled-(\d+)\.md$/)
+      if (m) used.add(Number(m[1]))
+    }
+  }
+  let n = 1
+  while (used.has(n)) n++
+  return `Untitled-${n}.md`
+}
+
 interface State {
   tabs: TabState[]
   activeTabId: string
@@ -127,6 +140,7 @@ interface State {
   reorderTabs: (reorderedTabs: TabState[]) => void
   renameTab: (tabId: string, customTitle: string | null) => void
   setTabPillColor: (tabId: string, color: string | null) => void
+  setTabPillIcon: (tabId: string, icon: string | null) => void
   clearTab: () => void
   toggleExpanded: () => void
   toggleTallView: (tabId: string) => void
@@ -243,6 +257,7 @@ function makeLocalTab(): TabState {
     bashExecuting: false,
     bashExecId: null,
     pillColor: null,
+    pillIcon: null,
     forkedFromSessionId: null,
     hasFileActivity: false,
     worktree: null,
@@ -644,7 +659,7 @@ export const useSessionStore = create<State>((set, get) => ({
         const newFile: FileEditorTab = {
           id,
           filePath: null,
-          fileName: 'Untitled.md',
+          fileName: nextUntitledName(s.fileEditorStates),
           content: '',
           savedContent: '',
           isDirty: false,
@@ -747,7 +762,7 @@ export const useSessionStore = create<State>((set, get) => ({
       const newFile: FileEditorTab = {
         id,
         filePath: null,
-        fileName: 'Untitled',
+        fileName: nextUntitledName(s.fileEditorStates),
         content: '',
         savedContent: '',
         isDirty: false,
@@ -1003,6 +1018,14 @@ export const useSessionStore = create<State>((set, get) => ({
     }))
   },
 
+  setTabPillIcon: (tabId, icon) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId ? { ...t, pillIcon: icon } : t
+      ),
+    }))
+  },
+
   clearTab: () => {
     const { activeTabId } = get()
     set((s) => ({
@@ -1044,6 +1067,7 @@ export const useSessionStore = create<State>((set, get) => ({
         additionalDirs: [...source.additionalDirs],
         permissionMode: source.permissionMode,
         pillColor: source.pillColor,
+        pillIcon: source.pillIcon,
         messages,
         permissionDenied: restoredDenied,
       }
@@ -1132,6 +1156,7 @@ export const useSessionStore = create<State>((set, get) => ({
         additionalDirs: [...source.additionalDirs],
         permissionMode: source.permissionMode,
         pillColor: source.pillColor,
+        pillIcon: source.pillIcon,
         messages,
         permissionDenied: restoredDenied,
       }
@@ -2107,10 +2132,14 @@ export const useSessionStore = create<State>((set, get) => ({
           ? {
               ...t,
               status: newStatus as TabStatus,
-              // Clear transient state on idle or terminal transitions
-              ...(newStatus === 'idle' || newStatus === 'failed' || newStatus === 'dead' || newStatus === 'completed'
+              // Clear transient state on idle or terminal transitions.
+              // 'completed' preserves permissionDenied — task_complete already set the
+              // correct value (plan-ready card or null). Clearing here would race with it.
+              ...(newStatus === 'idle' || newStatus === 'failed' || newStatus === 'dead'
                 ? { activeRequestId: null, currentActivity: '', permissionQueue: [] as import('../../shared/types').PermissionRequest[], permissionDenied: null }
-                : {}),
+                : newStatus === 'completed'
+                  ? { activeRequestId: null, currentActivity: '', permissionQueue: [] as import('../../shared/types').PermissionRequest[] }
+                  : {}),
             }
           : t
       ),
@@ -2216,6 +2245,7 @@ function persistTabs(): void {
       ...(t.historicalSessionIds.length > 0 ? { historicalSessionIds: t.historicalSessionIds } : {}),
       ...(t.bashResults.length > 0 ? { bashResults: t.bashResults } : {}),
       ...(t.pillColor ? { pillColor: t.pillColor } : {}),
+      ...(t.pillIcon ? { pillIcon: t.pillIcon } : {}),
       ...(t.forkedFromSessionId ? { forkedFromSessionId: t.forkedFromSessionId } : {}),
       ...(t.worktree ? { worktree: t.worktree } : {}),
       ...(t.groupId ? { groupId: t.groupId } : {}),
