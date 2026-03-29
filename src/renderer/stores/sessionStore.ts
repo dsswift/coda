@@ -192,7 +192,7 @@ interface State {
   removeDirectory: (dir: string) => void
   setBaseDirectory: (dir: string) => void
   setupWorktree: (tabId: string, sourceBranch: string, setAsDefault: boolean) => Promise<void>
-  convertToWorktree: (tabId: string) => void
+  convertToWorktree: (tabId: string) => Promise<void>
   cancelWorktreeSetup: (tabId: string) => void
   finishWorktreeTab: (tabId: string, strategyOverride?: 'merge' | 'pr') => Promise<void>
   addAttachments: (attachments: FileAttachment[]) => void
@@ -543,9 +543,10 @@ export const useSessionStore = create<State>((set, get) => ({
 
   openCliInTerminal: (tabId, sessionId, cwd) => {
     const safeCwd = cwd.replace(/'/g, "'\\''")
+    const bin = useThemeStore.getState().claudeCommand || 'claude'
     const cmd = sessionId
-      ? `cd '${safeCwd}' && claude --resume ${sessionId}`
-      : `cd '${safeCwd}' && claude`
+      ? `cd '${safeCwd}' && ${bin} --resume ${sessionId}`
+      : `cd '${safeCwd}' && ${bin}`
     set((s) => {
       const nextOpen = new Set(s.terminalOpenTabIds)
       const nextPending = new Map(s.terminalPendingCommands)
@@ -1133,7 +1134,8 @@ export const useSessionStore = create<State>((set, get) => ({
 
     try {
       const { tabId: newTabId } = await window.coda.createTab()
-      const messages: Message[] = source.messages.slice(0, idx + 1).map((m) => ({
+      const targetMessage = source.messages[idx]
+      const messages: Message[] = source.messages.slice(0, idx).map((m) => ({
         ...m,
         id: nextMsgId(),
       }))
@@ -1159,6 +1161,8 @@ export const useSessionStore = create<State>((set, get) => ({
         pillIcon: source.pillIcon,
         messages,
         permissionDenied: restoredDenied,
+        pendingInput: targetMessage.content,
+        draftInput: targetMessage.content,
       }
       set((s) => ({
         tabs: [...s.tabs, tab],
@@ -1550,7 +1554,31 @@ export const useSessionStore = create<State>((set, get) => ({
     }
   },
 
-  convertToWorktree: (tabId) => {
+  convertToWorktree: async (tabId) => {
+    const tab = get().tabs.find((t) => t.id === tabId)
+    if (!tab) return
+
+    const defaults = useThemeStore.getState().worktreeBranchDefaults
+    const defaultBranch = defaults[tab.workingDirectory]
+    if (defaultBranch) {
+      const result = await window.coda.gitWorktreeAdd(tab.workingDirectory, defaultBranch)
+      if (result.ok && result.worktree) {
+        set((s) => ({
+          tabs: s.tabs.map((t) =>
+            t.id === tabId
+              ? {
+                  ...t,
+                  worktree: result.worktree!,
+                  workingDirectory: result.worktree!.worktreePath,
+                  pendingWorktreeSetup: false,
+                }
+              : t
+          ),
+        }))
+        return
+      }
+    }
+
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.id === tabId ? { ...t, pendingWorktreeSetup: true } : t
@@ -2249,6 +2277,7 @@ function persistTabs(): void {
       ...(t.forkedFromSessionId ? { forkedFromSessionId: t.forkedFromSessionId } : {}),
       ...(t.worktree ? { worktree: t.worktree } : {}),
       ...(t.groupId ? { groupId: t.groupId } : {}),
+      ...(t.queuedPrompts.length > 0 ? { queuedPrompts: t.queuedPrompts } : {}),
     }))
 
   // Serialize editor states (per-directory, includes unsaved content)
