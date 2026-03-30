@@ -1,7 +1,8 @@
 import { create } from 'zustand'
-import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, FileAttachment, CatalogPlugin, PluginStatus, PersistedTabState } from '../../shared/types'
+import type { TabStatus, NormalizedEvent, EnrichedError, Message, TabState, Attachment, FileAttachment, CatalogPlugin, PluginStatus, PersistedTabState, TerminalInstance, TerminalPaneState, TerminalInstanceKind } from '../../shared/types'
 import { useThemeStore } from '../theme'
 import { destroyTerminalInstance } from '../components/TerminalPanel'
+import { serializeTerminalBuffer } from '../components/TerminalInstance'
 import notificationSrc from '../../../resources/notification.mp3'
 
 export { AVAILABLE_MODELS, getModelDisplayLabel } from './model-labels'
@@ -89,8 +90,14 @@ interface State {
   gitPanelOpen: boolean
   /** Tab IDs with their terminal panel visible */
   terminalOpenTabIds: Set<string>
-  /** Pending commands to run in terminal after PTY creation. Key = tabId */
+  /** Pending commands to run in terminal after PTY creation. Key = tabId:terminalId */
   terminalPendingCommands: Map<string, string>
+  /** Per-tab terminal multiplexing state */
+  terminalPanes: Map<string, TerminalPaneState>
+  /** Tab with terminal in tall mode (null = normal) */
+  terminalTallTabId: string | null
+  /** Tab with terminal in big screen mode (null = normal) */
+  terminalBigScreenTabId: string | null
   /** Directories with file explorer visible */
   fileExplorerOpenDirs: Set<string>
   /** Per-directory explorer state (expanded nodes, selection). Key = working directory path */
@@ -134,7 +141,7 @@ interface State {
   setPreferredModel: (model: string | null) => void
   setPermissionMode: (mode: 'ask' | 'auto' | 'plan') => void
   createTab: (useWorktree?: boolean) => Promise<string>
-  createTabInDirectory: (dir: string, useWorktree?: boolean) => Promise<string>
+  createTabInDirectory: (dir: string, useWorktree?: boolean, skipDuplicateCheck?: boolean) => Promise<string>
   selectTab: (tabId: string) => void
   closeTab: (tabId: string) => void
   reorderTabs: (reorderedTabs: TabState[]) => void
@@ -153,7 +160,17 @@ interface State {
   toggleTerminal: (tabId: string) => void
   openCliInTerminal: (tabId: string, sessionId: string | null, cwd: string) => void
   runInTerminal: (tabId: string, cmd: string) => void
-  consumeTerminalPendingCommand: (tabId: string) => string | undefined
+  consumeTerminalPendingCommand: (key: string) => string | undefined
+  createTerminalTab: () => Promise<string>
+  addTerminalInstance: (tabId: string, kind: string, cwd?: string) => string
+  removeTerminalInstance: (tabId: string, instanceId: string) => void
+  selectTerminalInstance: (tabId: string, instanceId: string) => void
+  toggleTerminalReadOnly: (tabId: string, instanceId: string) => void
+  toggleTerminalTall: (tabId: string) => void
+  toggleTerminalBigScreen: (tabId: string) => void
+  getOrCreateDedicatedTerminal: (tabId: string, kind: string) => string
+  runQuickTool: (tabId: string, toolId: string) => void
+  renameTerminalInstance: (tabId: string, instanceId: string, label: string) => void
   toggleFileExplorer: (tabId: string) => void
   setFileExplorerExpanded: (dir: string, path: string, expanded: boolean) => void
   setFileExplorerSelected: (dir: string, path: string | null) => void
@@ -264,7 +281,16 @@ function makeLocalTab(): TabState {
     pendingWorktreeSetup: false,
     groupId: null,
     contextTokens: null,
+    isTerminalOnly: false,
   }
+}
+
+function isBlankConversationTab(t: TabState, dir: string): boolean {
+  return !t.isTerminalOnly && t.messages.length === 0 && !t.customTitle && t.workingDirectory === dir
+}
+
+function isBlankTerminalTab(t: TabState, dir: string): boolean {
+  return t.isTerminalOnly && !t.customTitle && t.workingDirectory === dir
 }
 
 const initialTab = makeLocalTab()
@@ -278,6 +304,9 @@ export const useSessionStore = create<State>((set, get) => ({
   gitPanelOpen: false,
   terminalOpenTabIds: new Set<string>(),
   terminalPendingCommands: new Map<string, string>(),
+  terminalPanes: new Map<string, TerminalPaneState>(),
+  terminalTallTabId: null,
+  terminalBigScreenTabId: null,
   fileExplorerOpenDirs: new Set<string>(),
   fileExplorerStates: new Map(),
   fileEditorOpenDirs: new Set<string>(),
@@ -341,7 +370,7 @@ export const useSessionStore = create<State>((set, get) => ({
     const hasChosen = !!defaultBase
 
     const existingBlank = get().tabs.find(
-      (t) => t.messages.length === 0 && t.workingDirectory === startDir
+      (t) => isBlankConversationTab(t, startDir)
     )
     if (existingBlank) {
       set({ activeTabId: existingBlank.id })
@@ -396,13 +425,15 @@ export const useSessionStore = create<State>((set, get) => ({
     return tabId
   },
 
-  createTabInDirectory: async (dir, useWorktree) => {
-    const existingBlank = get().tabs.find(
-      (t) => t.messages.length === 0 && t.workingDirectory === dir
-    )
-    if (existingBlank) {
-      set({ activeTabId: existingBlank.id })
-      return existingBlank.id
+  createTabInDirectory: async (dir, useWorktree, skipDuplicateCheck) => {
+    if (!skipDuplicateCheck) {
+      const existingBlank = get().tabs.find(
+        (t) => isBlankConversationTab(t, dir)
+      )
+      if (existingBlank) {
+        set({ activeTabId: existingBlank.id })
+        return existingBlank.id
+      }
     }
 
     useThemeStore.getState().addRecentBaseDirectory(dir)
@@ -500,6 +531,8 @@ export const useSessionStore = create<State>((set, get) => ({
   toggleTallView: (tabId) => {
     set((s) => ({
       tallViewTabId: s.tallViewTabId === tabId ? null : tabId,
+      // Mutual exclusion with terminal tall
+      ...(s.tallViewTabId !== tabId ? { terminalTallTabId: null } : {}),
     }))
   },
 
@@ -532,13 +565,175 @@ export const useSessionStore = create<State>((set, get) => ({
   toggleTerminal: (tabId) => {
     set((s) => {
       const next = new Set(s.terminalOpenTabIds)
-      if (next.has(tabId)) {
+      const closing = next.has(tabId)
+      if (closing) {
         next.delete(tabId)
       } else {
         next.add(tabId)
       }
-      return { terminalOpenTabIds: next }
+      return {
+        terminalOpenTabIds: next,
+        ...(closing && s.terminalTallTabId === tabId ? { terminalTallTabId: null } : {}),
+        ...(closing && s.terminalBigScreenTabId === tabId ? { terminalBigScreenTabId: null } : {}),
+      }
     })
+  },
+
+  addTerminalInstance: (tabId, kind, cwd?) => {
+    const tab = get().tabs.find((t) => t.id === tabId)
+    const resolvedCwd = cwd || tab?.workingDirectory || '~'
+    const panes = new Map(get().terminalPanes)
+    const pane = panes.get(tabId) || { instances: [], activeInstanceId: null }
+    // Generate label
+    let labelBase = kind === 'commit' ? 'Commit' : kind === 'cli' ? 'CLI' : kind === 'user' ? 'Shell' : 'Shell'
+    if (kind.startsWith('tool:')) {
+      const toolId = kind.slice(5)
+      const tool = useThemeStore.getState().quickTools.find((t) => t.id === toolId)
+      labelBase = tool?.name || 'Tool'
+    }
+    const existingCount = pane.instances.filter((i) => i.kind === kind || (kind === 'user' && i.kind === 'user')).length
+    const label = kind === 'user' && existingCount > 0 ? `${labelBase} ${existingCount + 1}` : labelBase
+    const id = crypto.randomUUID().slice(0, 8)
+    const instance: TerminalInstance = { id, label, kind, readOnly: kind !== 'user', cwd: resolvedCwd }
+    panes.set(tabId, {
+      instances: [...pane.instances, instance],
+      activeInstanceId: id,
+    })
+    set({ terminalPanes: panes })
+    return id
+  },
+
+  removeTerminalInstance: (tabId, instanceId) => {
+    const panes = new Map(get().terminalPanes)
+    const pane = panes.get(tabId)
+    if (!pane) return
+    const key = `${tabId}:${instanceId}`
+    window.coda.terminalDestroy(key).catch(() => {})
+    destroyTerminalInstance(key)
+    const remaining = pane.instances.filter((i) => i.id !== instanceId)
+    const activeId = pane.activeInstanceId === instanceId
+      ? (remaining[remaining.length - 1]?.id || null)
+      : pane.activeInstanceId
+    if (remaining.length === 0) {
+      panes.delete(tabId)
+      const s = get()
+      const tab = s.tabs.find((t) => t.id === tabId)
+      if (tab?.isTerminalOnly) {
+        // Terminal-only tab: close the entire tab when last shell is removed
+        get().closeTab(tabId)
+        set({ terminalPanes: panes })
+      } else {
+        // Conversation tab: close the terminal pane and exit tall/big screen
+        const nextOpen = new Set(s.terminalOpenTabIds)
+        nextOpen.delete(tabId)
+        set({
+          terminalPanes: panes,
+          terminalOpenTabIds: nextOpen,
+          ...(s.terminalTallTabId === tabId ? { terminalTallTabId: null } : {}),
+          ...(s.terminalBigScreenTabId === tabId ? { terminalBigScreenTabId: null } : {}),
+        })
+      }
+    } else {
+      panes.set(tabId, { instances: remaining, activeInstanceId: activeId })
+      set({ terminalPanes: panes })
+    }
+  },
+
+  selectTerminalInstance: (tabId, instanceId) => {
+    const panes = new Map(get().terminalPanes)
+    const pane = panes.get(tabId)
+    if (!pane) return
+    panes.set(tabId, { ...pane, activeInstanceId: instanceId })
+    set({ terminalPanes: panes })
+  },
+
+  toggleTerminalReadOnly: (tabId, instanceId) => {
+    const panes = new Map(get().terminalPanes)
+    const pane = panes.get(tabId)
+    if (!pane) return
+    panes.set(tabId, {
+      ...pane,
+      instances: pane.instances.map((i) =>
+        i.id === instanceId ? { ...i, readOnly: !i.readOnly } : i
+      ),
+    })
+    set({ terminalPanes: panes })
+  },
+
+  toggleTerminalTall: (tabId) => {
+    set((s) => {
+      if (s.terminalTallTabId === tabId) {
+        return { terminalTallTabId: null }
+      }
+      // Mutual exclusion with conversation tall view
+      return { terminalTallTabId: tabId, tallViewTabId: null }
+    })
+  },
+
+  toggleTerminalBigScreen: (tabId) => {
+    set((s) => {
+      if (s.terminalBigScreenTabId === tabId) {
+        // Exit big screen -- also clear tall
+        return { terminalBigScreenTabId: null, terminalTallTabId: null }
+      }
+      return { terminalBigScreenTabId: tabId }
+    })
+  },
+
+  getOrCreateDedicatedTerminal: (tabId, kind) => {
+    const pane = get().terminalPanes.get(tabId)
+    const existing = pane?.instances.find((i) => i.kind === kind)
+    if (existing) return existing.id
+    return get().addTerminalInstance(tabId, kind)
+  },
+
+  renameTerminalInstance: (tabId, instanceId, label) => {
+    const panes = new Map(get().terminalPanes)
+    const pane = panes.get(tabId)
+    if (!pane) return
+    panes.set(tabId, {
+      ...pane,
+      instances: pane.instances.map((i) =>
+        i.id === instanceId ? { ...i, label } : i
+      ),
+    })
+    set({ terminalPanes: panes })
+  },
+
+  createTerminalTab: async () => {
+    const homeDir = get().staticInfo?.homePath || '~'
+    const defaultBase = useThemeStore.getState().defaultBaseDirectory
+    const startDir = defaultBase || homeDir
+
+    // Prevent duplicate blank terminal tabs in the same directory
+    const existingBlank = get().tabs.find((t) => isBlankTerminalTab(t, startDir))
+    if (existingBlank) {
+      set({ activeTabId: existingBlank.id })
+      return existingBlank.id
+    }
+
+    const { tabGroupMode, tabGroups } = useThemeStore.getState()
+    const groupId = tabGroupMode === 'manual'
+      ? (tabGroups.find((g) => g.isDefault)?.id || tabGroups[0]?.id || null)
+      : null
+
+    const tab: TabState = {
+      ...makeLocalTab(),
+      title: 'New Terminal',
+      isTerminalOnly: true,
+      workingDirectory: startDir,
+      hasChosenDirectory: !!defaultBase,
+      pillIcon: 'Terminal',
+      groupId,
+    }
+
+    set((s) => ({
+      tabs: [...s.tabs, tab],
+      activeTabId: tab.id,
+      terminalOpenTabIds: new Set([...s.terminalOpenTabIds, tab.id]),
+    }))
+
+    return tab.id
   },
 
   openCliInTerminal: (tabId, sessionId, cwd) => {
@@ -547,14 +742,18 @@ export const useSessionStore = create<State>((set, get) => ({
     const cmd = sessionId
       ? `cd '${safeCwd}' && ${bin} --resume ${sessionId}`
       : `cd '${safeCwd}' && ${bin}`
+    // Get or create dedicated CLI terminal
+    const instanceId = get().getOrCreateDedicatedTerminal(tabId, 'cli')
+    get().selectTerminalInstance(tabId, instanceId)
+    const key = `${tabId}:${instanceId}`
     set((s) => {
       const nextOpen = new Set(s.terminalOpenTabIds)
       const nextPending = new Map(s.terminalPendingCommands)
-      nextPending.set(tabId, cmd)
+      nextPending.set(key, cmd)
       if (nextOpen.has(tabId)) {
-        // Terminal already open -- write command directly
-        window.coda.terminalWrite(tabId, cmd + '\n')
-        nextPending.delete(tabId)
+        // Terminal pane already open -- check if PTY exists by trying to write
+        window.coda.terminalWrite(key, cmd + '\n')
+        nextPending.delete(key)
       } else {
         nextOpen.add(tabId)
       }
@@ -563,13 +762,17 @@ export const useSessionStore = create<State>((set, get) => ({
   },
 
   runInTerminal: (tabId, cmd) => {
+    // Get or create dedicated commit terminal
+    const instanceId = get().getOrCreateDedicatedTerminal(tabId, 'commit')
+    get().selectTerminalInstance(tabId, instanceId)
+    const key = `${tabId}:${instanceId}`
     set((s) => {
       const nextOpen = new Set(s.terminalOpenTabIds)
       const nextPending = new Map(s.terminalPendingCommands)
-      nextPending.set(tabId, cmd)
+      nextPending.set(key, cmd)
       if (nextOpen.has(tabId)) {
-        window.coda.terminalWrite(tabId, cmd + '\n')
-        nextPending.delete(tabId)
+        window.coda.terminalWrite(key, cmd + '\n')
+        nextPending.delete(key)
       } else {
         nextOpen.add(tabId)
       }
@@ -577,12 +780,44 @@ export const useSessionStore = create<State>((set, get) => ({
     })
   },
 
-  consumeTerminalPendingCommand: (tabId) => {
-    const cmd = get().terminalPendingCommands.get(tabId)
+  runQuickTool: (tabId, toolId) => {
+    const tool = useThemeStore.getState().quickTools.find((t) => t.id === toolId)
+    if (!tool) return
+    const tab = get().tabs.find((t) => t.id === tabId)
+    const cwd = tab?.workingDirectory || '~'
+    const kind = `tool:${toolId}`
+    const instanceId = get().getOrCreateDedicatedTerminal(tabId, kind)
+    get().selectTerminalInstance(tabId, instanceId)
+    // Resolve template variables (branch resolved async)
+    const resolveAndRun = async () => {
+      let branch = 'main'
+      try {
+        const result = await window.coda.gitChanges(cwd)
+        if (result?.branch) branch = result.branch
+      } catch { /* fall back to 'main' */ }
+      const cmd = tool.command.replace(/\{cwd\}/g, cwd).replace(/\{branch\}/g, branch)
+      const key = `${tabId}:${instanceId}`
+      const s = get()
+      const nextOpen = new Set(s.terminalOpenTabIds)
+      const nextPending = new Map(s.terminalPendingCommands)
+      nextPending.set(key, cmd)
+      if (nextOpen.has(tabId)) {
+        window.coda.terminalWrite(key, cmd + '\n')
+        nextPending.delete(key)
+      } else {
+        nextOpen.add(tabId)
+      }
+      set({ terminalOpenTabIds: nextOpen, terminalPendingCommands: nextPending })
+    }
+    resolveAndRun()
+  },
+
+  consumeTerminalPendingCommand: (key) => {
+    const cmd = get().terminalPendingCommands.get(key)
     if (cmd) {
       set((s) => {
         const next = new Map(s.terminalPendingCommands)
-        next.delete(tabId)
+        next.delete(key)
         return { terminalPendingCommands: next }
       })
     }
@@ -941,14 +1176,25 @@ export const useSessionStore = create<State>((set, get) => ({
       ).catch(() => {})
     }
     window.coda.closeTab(tabId).catch(() => {})
-    window.coda.terminalDestroy(tabId).catch(() => {})
-    destroyTerminalInstance(tabId)
+    // Clean up all terminal instances for this tab
+    const pane = get().terminalPanes.get(tabId)
+    if (pane) {
+      for (const inst of pane.instances) {
+        const key = `${tabId}:${inst.id}`
+        window.coda.terminalDestroy(key).catch(() => {})
+        destroyTerminalInstance(key)
+      }
+    }
     // Clean up terminal UI state
     const termIds = get().terminalOpenTabIds
+    const panes = new Map(get().terminalPanes)
+    panes.delete(tabId)
     if (termIds.has(tabId)) {
       const next = new Set(termIds)
       next.delete(tabId)
-      set({ terminalOpenTabIds: next })
+      set({ terminalOpenTabIds: next, terminalPanes: panes })
+    } else {
+      set({ terminalPanes: panes })
     }
     // Clean up dir-based explorer/editor visibility if no other tabs share this directory
     if (closingTab) {
@@ -2260,25 +2506,39 @@ function persistTabs(): void {
     if (dirState.files.length > 0) dirsWithEditorState.add(dir)
   }
 
+  const { terminalPanes } = useSessionStore.getState()
+
   const persistedTabs = tabs
-    .filter((t) => t.claudeSessionId || t.historicalSessionIds.length > 0 || (t.hasChosenDirectory && dirsWithEditorState.has(t.workingDirectory)))
-    .map((t) => ({
-      claudeSessionId: t.claudeSessionId,
-      title: t.customTitle || t.title,
-      customTitle: t.customTitle,
-      workingDirectory: t.workingDirectory,
-      hasChosenDirectory: t.hasChosenDirectory,
-      additionalDirs: t.additionalDirs,
-      permissionMode: t.permissionMode,
-      ...(t.historicalSessionIds.length > 0 ? { historicalSessionIds: t.historicalSessionIds } : {}),
-      ...(t.bashResults.length > 0 ? { bashResults: t.bashResults } : {}),
-      ...(t.pillColor ? { pillColor: t.pillColor } : {}),
-      ...(t.pillIcon ? { pillIcon: t.pillIcon } : {}),
-      ...(t.forkedFromSessionId ? { forkedFromSessionId: t.forkedFromSessionId } : {}),
-      ...(t.worktree ? { worktree: t.worktree } : {}),
-      ...(t.groupId ? { groupId: t.groupId } : {}),
-      ...(t.queuedPrompts.length > 0 ? { queuedPrompts: t.queuedPrompts } : {}),
-    }))
+    .map((t) => {
+      const pane = terminalPanes.get(t.id)
+      return {
+        claudeSessionId: t.claudeSessionId,
+        title: t.customTitle || t.title,
+        customTitle: t.customTitle,
+        workingDirectory: t.workingDirectory,
+        hasChosenDirectory: t.hasChosenDirectory,
+        additionalDirs: t.additionalDirs,
+        permissionMode: t.permissionMode,
+        ...(t.historicalSessionIds.length > 0 ? { historicalSessionIds: t.historicalSessionIds } : {}),
+        ...(t.bashResults.length > 0 ? { bashResults: t.bashResults } : {}),
+        ...(t.pillColor ? { pillColor: t.pillColor } : {}),
+        ...(t.pillIcon ? { pillIcon: t.pillIcon } : {}),
+        ...(t.forkedFromSessionId ? { forkedFromSessionId: t.forkedFromSessionId } : {}),
+        ...(t.worktree ? { worktree: t.worktree } : {}),
+        ...(t.groupId ? { groupId: t.groupId } : {}),
+        ...(t.queuedPrompts.length > 0 ? { queuedPrompts: t.queuedPrompts } : {}),
+        ...(t.isTerminalOnly ? { isTerminalOnly: true } : {}),
+        ...(pane && pane.instances.length > 0 ? { terminalInstances: pane.instances } : {}),
+        ...(pane && pane.instances.length > 0 ? (() => {
+          const buffers: Record<string, string> = {}
+          for (const inst of pane.instances) {
+            const buf = serializeTerminalBuffer(`${t.id}:${inst.id}`)
+            if (buf) buffers[inst.id] = buf
+          }
+          return Object.keys(buffers).length > 0 ? { terminalBuffers: buffers } : {}
+        })() : {}),
+      }
+    })
 
   // Serialize editor states (per-directory, includes unsaved content)
   const { fileEditorStates } = useSessionStore.getState()
@@ -2305,15 +2565,10 @@ function persistTabs(): void {
 
   const { isExpanded, fileEditorOpenDirs, editorGeometry, planGeometry } = useSessionStore.getState()
 
-  // Resolve active tab as index into persistedTabs (handles sessionless tabs)
+  // All tabs are now persisted, so resolve active tab index directly
   let activeTabIndex: number | null = null
-  let persistedIdx = 0
-  for (const t of tabs) {
-    const isPersisted = t.claudeSessionId || (t.hasChosenDirectory && dirsWithEditorState.has(t.workingDirectory))
-    if (isPersisted) {
-      if (t.id === activeTabId) activeTabIndex = persistedIdx
-      persistedIdx++
-    }
+  for (let i = 0; i < tabs.length; i++) {
+    if (tabs[i].id === activeTabId) { activeTabIndex = i; break }
   }
 
   const data: PersistedTabState = {
@@ -2363,7 +2618,7 @@ async function persistSessionChains(): Promise<void> {
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 useSessionStore.subscribe((state, prev) => {
-  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId || state.fileEditorStates !== prev.fileEditorStates || state.isExpanded !== prev.isExpanded || state.fileEditorOpenDirs !== prev.fileEditorOpenDirs || state.editorGeometry !== prev.editorGeometry || state.planGeometry !== prev.planGeometry) {
+  if (state.tabs !== prev.tabs || state.activeTabId !== prev.activeTabId || state.fileEditorStates !== prev.fileEditorStates || state.isExpanded !== prev.isExpanded || state.fileEditorOpenDirs !== prev.fileEditorOpenDirs || state.editorGeometry !== prev.editorGeometry || state.planGeometry !== prev.planGeometry || state.terminalPanes !== prev.terminalPanes) {
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(persistTabs, 100)
   }
