@@ -60,14 +60,14 @@ Go WebSocket relay for iOS remote connections. Deployed to the `coda-relay` name
 **Build and deploy:**
 ```bash
 make relay                    # docker build --platform linux/amd64
-docker tag coda-relay:latest spraguehouse.azurecr.io/coda/relay:latest
-az acr login --name spraguehouse
-docker push spraguehouse.azurecr.io/coda/relay:latest
+docker tag coda-relay:latest ghcr.io/dsswift/coda/relay:latest
+gh auth token | docker login ghcr.io -u "$(gh api user --jq .login)" --password-stdin
+docker push ghcr.io/dsswift/coda/relay:latest
 ```
 
 ArgoCD manages the deployment. For immediate rollout, patch the deployment:
 ```bash
-kubectl set image deployment/coda-relay -n coda-relay relay=spraguehouse.azurecr.io/coda/relay:latest
+kubectl set image deployment/coda-relay -n coda-relay relay=ghcr.io/dsswift/coda/relay:latest
 ```
 
 **Local dev:** `make relay-local` runs the relay natively with a random API key and mDNS.
